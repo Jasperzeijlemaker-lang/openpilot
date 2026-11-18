@@ -225,6 +225,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   struct SmartCruiseControl {
     vision @0 :Vision;
     map @1 :Map;
+    merge @2 :Merge;
 
     struct Vision {
       state @0 :VisionState;
@@ -242,6 +243,29 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
       aTarget @2 :Float32;
       enabled @3 :Bool;
       active @4 :Bool;
+    }
+
+    struct Merge {
+      state @0 :MergeState;
+      vTarget @1 :Float32;
+      aTarget @2 :Float32;
+      enabled @3 :Bool;
+      active @4 :Bool;
+      testOnly @5 :Bool; # Detect and alert only, never change the speed target.
+      detected @6 :Bool; # A merging vehicle has been seen for long enough to act on.
+      leadDistance @7 :Float32; # m, to the merging vehicle.
+      leadLateralOffset @8 :Float32; # m, sideways from our planned path. Positive is right.
+      leadClosingSpeed @9 :Float32; # m/s, sideways speed toward our path.
+      leadSpeed @10 :Float32; # m/s, speed of the merging vehicle.
+      fault @11 :Bool; # The controller hit an unexpected error and switched itself off until restart.
+    }
+
+    enum MergeState {
+      disabled @0; # System disabled or inactive.
+      enabled @1; # Watching, no merging vehicle.
+      slowing @2; # A vehicle is merging into our lane, speed target reduced.
+      holding @3; # Vehicle merged or gone, keeping the reduced target briefly.
+      overriding @4; # System overriding with manual control.
     }
 
     enum VisionState {
@@ -306,6 +330,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     sccVision @1;
     sccMap @2;
     speedLimitAssist @3;
+    sccMerge @4;
   }
 
   struct E2eAlerts {
@@ -360,6 +385,9 @@ struct OnroadEventSP @0xda96579883444c35 {
     e2eChime @23;
     laneChangeRoadEdge @24;
     bigModelReady @25;
+    mergeAssistSlowing @26;
+    mergeAssistTest @27;
+    mergeAssistFault @28;
   }
 }
 

@@ -233,6 +233,30 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 5.),
   },
 
+  EventNameSP.mergeAssistSlowing: {
+    ET.WARNING: Alert(
+      "Slowing for merging vehicle",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
+  },
+
+  EventNameSP.mergeAssistTest: {
+    ET.WARNING: Alert(
+      "Merging vehicle detected (test only)",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
+  },
+
+  EventNameSP.mergeAssistFault: {
+    ET.WARNING: Alert(
+      "Merge assist turned itself off",
+      "Unexpected error. Restart the device to re-enable.",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
+  },
+
   EventNameSP.e2eChime: {
     ET.PERMANENT: Alert(
       "",

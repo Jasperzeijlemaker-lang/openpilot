@@ -1030,6 +1030,76 @@
                   ]
                 }
               ]
+            },
+            {
+              "key": "SmartCruiseControlMerge",
+              "widget": "toggle",
+              "title": "Merge (Alpha)",
+              "description": "On the highway, lower the cruise speed when a vehicle in the next lane on the right is moving into your lane, so it has room to merge ahead of you. Vision only: it cannot see vehicles beside or behind you. You must stay ready to brake.",
+              "visibility": [
+                {
+                  "type": "any",
+                  "conditions": [
+                    {
+                      "type": "capability",
+                      "field": "has_longitudinal_control",
+                      "equals": true
+                    },
+                    {
+                      "type": "capability",
+                      "field": "has_icbm",
+                      "equals": true
+                    }
+                  ]
+                }
+              ],
+              "enablement": [
+                {
+                  "type": "any",
+                  "conditions": [
+                    {
+                      "type": "capability",
+                      "field": "has_longitudinal_control",
+                      "equals": true
+                    },
+                    {
+                      "type": "capability",
+                      "field": "has_icbm",
+                      "equals": true
+                    }
+                  ]
+                }
+              ],
+              "sub_items": [
+                {
+                  "key": "SmartCruiseControlMergeTestOnly",
+                  "widget": "toggle",
+                  "title": "Test Only",
+                  "description": "Show an alert when a merging vehicle is detected, but do not change the cruise speed.",
+                  "enablement": [
+                    {
+                      "type": "param",
+                      "key": "SmartCruiseControlMerge",
+                      "equals": true
+                    }
+                  ]
+                },
+                {
+                  "key": "SmartCruiseControlMergeMaxDrop",
+                  "widget": "option",
+                  "title": "Max Speed Reduction (mph)",
+                  "min": 5,
+                  "max": 30,
+                  "step": 5,
+                  "enablement": [
+                    {
+                      "type": "param",
+                      "key": "SmartCruiseControlMerge",
+                      "equals": true
+                    }
+                  ]
+                }
+              ]
             }
           ]
         }

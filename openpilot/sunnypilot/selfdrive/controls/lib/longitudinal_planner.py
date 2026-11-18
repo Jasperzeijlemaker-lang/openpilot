@@ -13,12 +13,14 @@ from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_boost import AccelBoostSP
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_cruise_control import SmartCruiseControl
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.merge_controller import MergeState
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
+EventNameSP = custom.OnroadEventSP.EventName
 
 
 class LongitudinalPlannerSP:
@@ -47,6 +49,10 @@ class LongitudinalPlannerSP:
 
     # Smart Cruise Control
     self.scc.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)
+    if self.scc.merge.fault_alert:
+      self.events_sp.add(EventNameSP.mergeAssistFault)
+    elif self.scc.merge.state == MergeState.slowing:
+      self.events_sp.add(EventNameSP.mergeAssistTest if self.scc.merge.test_only else EventNameSP.mergeAssistSlowing)
 
     # Speed Limit Resolver
     self.resolver.update(v_ego, sm)
@@ -60,6 +66,7 @@ class LongitudinalPlannerSP:
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),
       LongitudinalPlanSource.sccVision: (self.scc.vision.output_v_target, self.scc.vision.output_a_target),
       LongitudinalPlanSource.sccMap: (self.scc.map.output_v_target, self.scc.map.output_a_target),
+      LongitudinalPlanSource.sccMerge: (self.scc.merge.output_v_target, self.scc.merge.output_a_target),
       LongitudinalPlanSource.speedLimitAssist: (self.sla.output_v_target, self.sla.output_a_target),
     }
 
@@ -103,6 +110,22 @@ class LongitudinalPlannerSP:
     sccMap.aTarget = float(self.scc.map.output_a_target)
     sccMap.enabled = self.scc.map.is_enabled
     sccMap.active = self.scc.map.is_active
+    # Merge Control
+    merge = self.scc.merge
+    sccMerge = smartCruiseControl.merge
+    sccMerge.state = merge.state
+    sccMerge.vTarget = float(merge.output_v_target)
+    sccMerge.aTarget = float(merge.output_a_target)
+    sccMerge.enabled = merge.is_enabled
+    sccMerge.active = merge.is_active
+    sccMerge.testOnly = merge.test_only
+    sccMerge.detected = merge.detected
+    sccMerge.fault = merge.fault
+    if merge.candidate is not None:
+      sccMerge.leadDistance = float(merge.candidate.dist)
+      sccMerge.leadLateralOffset = float(merge.candidate.offset)
+      sccMerge.leadClosingSpeed = float(merge.candidate.closing_speed)
+      sccMerge.leadSpeed = float(merge.candidate.v_lead)
 
     # Speed Limit
     speedLimit = longitudinalPlanSP.speedLimit

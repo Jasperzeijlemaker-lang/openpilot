@@ -57,6 +57,24 @@ class CruiseLayout(Widget):
       description=tr("Use map data to estimate the appropriate speed to drive through turns ahead."),
       param="SmartCruiseControlMap")
 
+    self.scc_merge_toggle = toggle_item_sp(
+      title=tr("Smart Cruise Control - Merge (Alpha)"),
+      description=tr("On the highway, lower the cruise speed when a vehicle in the next lane on the right is moving into your lane, " +
+                     "so it has room to merge ahead of you. Vision only: it cannot see vehicles beside or behind you. You must stay ready to brake."),
+      param="SmartCruiseControlMerge")
+
+    self.scc_merge_test_toggle = toggle_item_sp(
+      title=tr("Merge: Test Only"),
+      description=tr("Show an alert when a merging vehicle is detected, but do not change the cruise speed. " +
+                     "Use this to check the detection on your own roads before turning it off."),
+      param="SmartCruiseControlMergeTestOnly")
+
+    self.scc_merge_max_drop = option_item_sp(
+      title=tr("Merge: Max Speed Reduction (mph)"),
+      param="SmartCruiseControlMergeMaxDrop",
+      min_value=5, max_value=30, value_change_step=5,
+      inline=True)
+
     self.accel_boost_toggle = toggle_item_sp(
       title=tr("Acceleration Boost"),
       description=tr("Adds a small push on top of sunnypilot's own acceleration, stronger in Aggressive and gentler in Relaxed. " +
@@ -92,6 +110,9 @@ class CruiseLayout(Widget):
       self.icbm_toggle,
       self.scc_v_toggle,
       self.scc_m_toggle,
+      self.scc_merge_toggle,
+      self.scc_merge_test_toggle,
+      self.scc_merge_max_drop,
       self.accel_boost_toggle,
       self.custom_acc_toggle,
       self.custom_acc_short_increment,
@@ -149,13 +170,16 @@ class CruiseLayout(Widget):
         self.custom_acc_toggle.action_item.set_enabled(((has_long and not ui_state.CP.pcmCruise) or has_icbm) and ui_state.is_offroad())
         self.scc_v_toggle.action_item.set_enabled(True)
         self.scc_m_toggle.action_item.set_enabled(True)
+        self.scc_merge_toggle.action_item.set_enabled(True)
       else:
         ui_state.params.remove("CustomAccIncrementsEnabled")
         ui_state.params.remove("SmartCruiseControlVision")
         ui_state.params.remove("SmartCruiseControlMap")
+        ui_state.params.remove("SmartCruiseControlMerge")
         self.custom_acc_toggle.action_item.set_enabled(False)
         self.scc_v_toggle.action_item.set_enabled(False)
         self.scc_m_toggle.action_item.set_enabled(False)
+        self.scc_merge_toggle.action_item.set_enabled(False)
 
     else:
       has_icbm = has_long = False

@@ -292,6 +292,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // Smart Cruise Control
     {"MapTargetVelocities", {CLEAR_ON_ONROAD_TRANSITION, STRING}},
     {"SmartCruiseControlMap", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"SmartCruiseControlMerge", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"SmartCruiseControlMergeMaxDrop", {PERSISTENT | BACKUP, INT, "20"}},
+    {"SmartCruiseControlMergeTestOnly", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"SmartCruiseControlVision", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // Torque lateral control custom params
