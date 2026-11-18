@@ -291,6 +291,14 @@ sections:
       - type: param
         key: SmartCruiseControlMerge
         equals: true
+    - key: SmartCruiseControlMergeBothSides
+      widget: toggle
+      title: Watch Both Sides
+      description: 'Off: only watch the lane on your right (on-ramps). On: also watch the lane on your left. Expect more slowdowns in busy traffic, because vehicles that pass and pull in ahead of you can trigger it.'
+      enablement:
+      - type: param
+        key: SmartCruiseControlMerge
+        equals: true
     - key: SmartCruiseControlMergeMaxDrop
       widget: option
       title: Max Speed Reduction (mph)

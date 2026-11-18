@@ -69,6 +69,12 @@ class CruiseLayout(Widget):
                      "Use this to check the detection on your own roads before turning it off."),
       param="SmartCruiseControlMergeTestOnly")
 
+    self.scc_merge_both_sides_toggle = toggle_item_sp(
+      title=tr("Merge: Watch Both Sides"),
+      description=tr("Off: only watch the lane on your right (on-ramps). On: also watch the lane on your left. " +
+                     "Expect more slowdowns in busy traffic, because vehicles that pass and pull in ahead of you can trigger it."),
+      param="SmartCruiseControlMergeBothSides")
+
     self.scc_merge_max_drop = option_item_sp(
       title=tr("Merge: Max Speed Reduction (mph)"),
       param="SmartCruiseControlMergeMaxDrop",
@@ -112,6 +118,7 @@ class CruiseLayout(Widget):
       self.scc_m_toggle,
       self.scc_merge_toggle,
       self.scc_merge_test_toggle,
+      self.scc_merge_both_sides_toggle,
       self.scc_merge_max_drop,
       self.accel_boost_toggle,
       self.custom_acc_toggle,

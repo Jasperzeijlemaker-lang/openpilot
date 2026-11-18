@@ -7,7 +7,8 @@ See the LICENSE.md file in the root directory for more details.
 Smart Cruise Control - Merge (SCC-Merge)
 
 Watches the driving model's lead outputs for a vehicle that sits in the lane next to ours
-and is moving sideways toward our path (an on-ramp merge or a cut-in). While that is true,
+and is moving sideways toward our path (an on-ramp merge or a cut-in). By default only the
+right side is watched; the "both sides" setting adds the left. While that is true,
 it lowers the cruise target so the merging vehicle has room to slot in ahead of us.
 
 It only ever lowers the target. Like the other Smart Cruise Control controllers, the result is
@@ -51,6 +52,7 @@ ENABLED_STATES = (MergeState.enabled, MergeState.overriding, *ACTIVE_STATES)
 
 # +1: watch the right side (on-ramps in right-hand traffic). -1: watch the left side.
 # Lateral values follow the model frame: positive y is to the right.
+# The "both sides" setting watches the other side as well.
 MERGE_SIDE = 1.
 
 MIN_V_HIGHWAY = 20.  # m/s (~45 mph). Below this we are not on a highway; do nothing.
@@ -168,6 +170,7 @@ class SmartCruiseControlMerge:
 
     self.enabled = False
     self.test_only = True
+    self.both_sides = False
     self.max_drop = _DEFAULT_MAX_DROP_MPH * CV.MPH_TO_MS
 
     self.state = MergeState.disabled
@@ -197,6 +200,7 @@ class SmartCruiseControlMerge:
   def _read_params(self) -> None:
     self.enabled = self.params.get_bool("SmartCruiseControlMerge")
     self.test_only = self.params.get_bool("SmartCruiseControlMergeTestOnly")
+    self.both_sides = self.params.get_bool("SmartCruiseControlMergeBothSides")
     try:
       max_drop_mph = float(self.params.get("SmartCruiseControlMergeMaxDrop", return_default=True))
     except (TypeError, ValueError):
@@ -276,7 +280,7 @@ class SmartCruiseControlMerge:
       offset = lead_y - float(np.interp(dist, path_x, path_y))
       track.update(dist, offset, dt)
 
-      on_watched_side = offset * MERGE_SIDE > 0.
+      on_watched_side = self.both_sides or offset * MERGE_SIDE > 0.
       in_next_lane = _IN_PATH_OFFSET < abs(offset) < _MAX_OFFSET
       in_range = _MIN_DIST < dist < max_dist
       needs_room = v_lead < self.v_ego + _MAX_FASTER

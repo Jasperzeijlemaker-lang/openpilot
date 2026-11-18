@@ -154,6 +154,36 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     self.run_scene(3., lat_speed=0.8, stop_y=1.2, side=-1.)
     assert self.scc.state == MergeState.enabled
 
+  def test_left_side_with_both_sides_setting(self):
+    self.params.put_bool("SmartCruiseControlMergeBothSides", True, block=True)
+    self.scc = SmartCruiseControlMerge()
+    self.run_scene(2., lat_speed=0.8, stop_y=1.2, side=-1.)
+    assert self.scc.state == MergeState.slowing
+    assert self.scc.candidate.offset < 0.
+    assert V_CRUISE - 20 * CV.MPH_TO_MS <= self.scc.output_v_target < 27.
+
+  def test_right_side_still_works_with_both_sides_setting(self):
+    self.params.put_bool("SmartCruiseControlMergeBothSides", True, block=True)
+    self.scc = SmartCruiseControlMerge()
+    self.run_scene(2., lat_speed=0.8, stop_y=1.2)
+    assert self.scc.state == MergeState.slowing
+    assert self.scc.candidate.offset > 0.
+
+  def test_left_side_faster_passing_car_is_ignored(self):
+    # The common case on the left: a car passes us and pulls in ahead while pulling away. No slowdown.
+    self.params.put_bool("SmartCruiseControlMergeBothSides", True, block=True)
+    self.scc = SmartCruiseControlMerge()
+    self.run_scene(3., v=V_EGO + 4., lat_speed=0.8, stop_y=1.2, side=-1.)
+    assert self.scc.state == MergeState.enabled
+    assert self.scc.output_v_target == V_CRUISE_UNSET
+
+  def test_left_side_car_moving_away_is_ignored(self):
+    # A car in the left lane drifting further left is not coming into our lane.
+    self.params.put_bool("SmartCruiseControlMergeBothSides", True, block=True)
+    self.scc = SmartCruiseControlMerge()
+    self.run_scene(3., y0=1.5, lat_speed=-0.6, stop_y=-10., side=-1.)
+    assert self.scc.state == MergeState.enabled
+
   def test_low_model_confidence_is_ignored(self):
     self.run_scene(3., lat_speed=0.8, stop_y=1.2, prob=0.2)
     assert self.scc.state == MergeState.enabled
@@ -411,6 +441,7 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
         seeds = [(rng.uniform(15., 70.), rng.uniform(2., 4.), v_ego - rng.uniform(-1., 15.), rng.uniform(0.4, 1.5), 0.9)]
       if rng.random() < 0.3:
         self.params.put_bool("SmartCruiseControlMergeTestOnly", rng.random() < 0.5, block=True)
+        self.params.put_bool("SmartCruiseControlMergeBothSides", rng.random() < 0.5, block=True)
         self.params.put("SmartCruiseControlMergeMaxDrop", rng.choice([5, 20, 30, -4, 999]), block=True)
       for i in range(100):
         leads = []
