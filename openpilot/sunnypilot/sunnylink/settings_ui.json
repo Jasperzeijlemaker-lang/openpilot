@@ -1102,7 +1102,7 @@
                   "widget": "option",
                   "title": "Max Speed Reduction (mph)",
                   "min": 5,
-                  "max": 30,
+                  "max": 40,
                   "step": 5,
                   "enablement": [
                     {

@@ -126,6 +126,13 @@ class LongitudinalPlannerSP:
       sccMerge.leadLateralOffset = float(merge.candidate.offset)
       sccMerge.leadClosingSpeed = float(merge.candidate.closing_speed)
       sccMerge.leadSpeed = float(merge.candidate.v_lead)
+      sccMerge.trigger = int(merge.candidate.trigger)
+    sccMerge.rightLaneEnding = bool(merge.lane_ending[1.])
+    sccMerge.leftLaneEnding = bool(merge.lane_ending[-1.])
+    sccMerge.leadsProb = [float(v) for v in merge.debug_prob]
+    sccMerge.leadsDistance = [float(v) for v in merge.debug_dist]
+    sccMerge.leadsLateralOffset = [float(v) for v in merge.debug_offset]
+    sccMerge.leadsSpeed = [float(v) for v in merge.debug_speed]
 
     # Speed Limit
     speedLimit = longitudinalPlanSP.speedLimit

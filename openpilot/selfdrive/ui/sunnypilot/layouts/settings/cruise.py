@@ -78,7 +78,7 @@ class CruiseLayout(Widget):
     self.scc_merge_max_drop = option_item_sp(
       title=tr("Merge: Max Speed Reduction (mph)"),
       param="SmartCruiseControlMergeMaxDrop",
-      min_value=5, max_value=30, value_change_step=5,
+      min_value=5, max_value=40, value_change_step=5,
       inline=True)
 
     self.accel_boost_toggle = toggle_item_sp(

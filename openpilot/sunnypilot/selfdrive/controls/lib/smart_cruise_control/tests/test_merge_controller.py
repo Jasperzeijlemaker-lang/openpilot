@@ -20,7 +20,8 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.merge_controller import SmartCruiseControlMerge, \
   MIN_V_HIGHWAY, MIN_V_TARGET, _HOLD_TIME, _LOST_TIME, _MAX_EVENT_TIME, _COOLDOWN_TIME, _REARM_TIME, \
-  _TIMEOUT_LOCKOUT_TIME, _FAULT_ALERT_TIME, _MAX_FRAME_GAP
+  _TIMEOUT_LOCKOUT_TIME, _FAULT_ALERT_TIME, _MAX_FRAME_GAP, TRIGGER_MEASURED, TRIGGER_PREDICTED, TRIGGER_ENCROACHING, \
+  TRIGGER_LANE_ENDING
 from openpilot.common.test import OpenpilotTestCase
 
 MergeState = custom.LongitudinalPlanSP.SmartCruiseControl.MergeState
@@ -59,6 +60,30 @@ def make_model(leads, curvature: float = 0., frame_id: int | None = None, model_
   return model.modelV2
 
 
+def add_lanes(md, right_lane_ends: bool = False, left_lane_ends: bool = False, right_lane: bool = True, left_lane: bool = True,
+              edge_std: float = 0.3, line_prob: float = 0.9):
+  """Straight road. Our lane is 3.6 m wide. Optionally a lane on each side that either continues or tapers away by 90 m."""
+  xs = [float(x) for x in ModelConstants.X_IDXS]
+
+  def xy(ys):
+    m = log.XYZTData.new_message()
+    m.x = xs
+    m.y = [float(y) for y in ys]
+    return m
+
+  def edge(sign, has_lane, ends):
+    full = 1.8 + (3.6 if has_lane else 0.) + 0.5
+    if not (has_lane and ends):
+      return [sign * full for _ in xs]
+    return [sign * (full - 3.6 * min(max((x - 20.) / 70., 0.), 1.)) for x in xs]
+
+  md.laneLines = [xy([-5.4] * len(xs)), xy([-1.8] * len(xs)), xy([1.8] * len(xs)), xy([5.4] * len(xs))]
+  md.laneLineProbs = [line_prob] * 4
+  md.roadEdges = [xy(edge(-1., left_lane, left_lane_ends)), xy(edge(1., right_lane, right_lane_ends))]
+  md.roadEdgeStds = [edge_std, edge_std]
+  return md
+
+
 def make_car_state(blinker: bool = False, v_ego: float = V_EGO):
   car_state = messaging.new_message('carState')
   car_state.carState.vEgo = v_ego
@@ -73,9 +98,11 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     self.params.put_bool("SmartCruiseControlMerge", True, block=True)
     self.params.put_bool("SmartCruiseControlMergeTestOnly", False, block=True)
     self.params.put("SmartCruiseControlMergeMaxDrop", 20, block=True)
+    self.params.put_bool("SmartCruiseControlMergeBothSides", False, block=True)
     self.scc = SmartCruiseControlMerge()
     self.car_state = make_car_state()
     self.blinker = False
+    self.lanes: dict = {}
 
   def run_scene(self, seconds: float, dist: float = 40., y0: float = 3.6, v: float = 27., lat_speed: float = 0.,
                 prob: float = 0.9, v_ego: float = V_EGO, override: bool = False, curvature: float = 0., side: float = 1.,
@@ -87,7 +114,10 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     for _ in range(int(seconds / DT_MDL)):
       path_y = 0.5 * curvature * dist ** 2
       lead = make_lead(dist, side * y + path_y, v, side * lat_speed if model_predicts else 0., prob, v_ego)
-      sm: Any = {'modelV2': make_model([lead], curvature, frame_id), 'carState': self.car_state}
+      md = make_model([lead], curvature, frame_id)
+      if self.lanes:
+        add_lanes(md, **self.lanes)
+      sm: Any = {'modelV2': md, 'carState': self.car_state}
       self.scc.update(sm, long_enabled, override, v_ego, 0., v_cruise)
       self.check_output(v_cruise)
       y = max(stop_y, y - lat_speed * DT_MDL)
@@ -147,7 +177,7 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     assert self.scc.output_v_target == V_CRUISE_UNSET
 
   def test_far_vehicle_is_ignored(self):
-    self.run_scene(3., dist=150., lat_speed=0.8, stop_y=1.2)
+    self.run_scene(3., dist=200., lat_speed=0.8, stop_y=1.2)
     assert self.scc.state == MergeState.enabled
 
   def test_left_side_is_ignored(self):
@@ -181,7 +211,7 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     # A car in the left lane drifting further left is not coming into our lane.
     self.params.put_bool("SmartCruiseControlMergeBothSides", True, block=True)
     self.scc = SmartCruiseControlMerge()
-    self.run_scene(3., y0=1.5, lat_speed=-0.6, stop_y=-10., side=-1.)
+    self.run_scene(3., y0=1.5, v=V_EGO, lat_speed=-0.6, stop_y=-10., side=-1.)
     assert self.scc.state == MergeState.enabled
 
   def test_low_model_confidence_is_ignored(self):
@@ -210,13 +240,14 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
 
   def test_model_prediction_trigger(self):
     # Barely moving yet, but the model predicts it will be in our lane within 2 s.
-    self.run_scene(0.2, y0=2.4, lat_speed=0.)
+    self.run_scene(0.2, y0=3.0, lat_speed=0.)
     assert self.scc.state == MergeState.enabled
     for _ in range(int(1. / DT_MDL)):
-      lead = make_lead(40., 2.4, 27., lat_speed=0.9)
+      lead = make_lead(40., 3.0, 27., lat_speed=1.2)
       sm: Any = {'modelV2': make_model([lead]), 'carState': self.car_state}
       self.scc.update(sm, True, False, V_EGO, 0., V_CRUISE)
     assert self.scc.state == MergeState.slowing
+    assert self.scc.candidate.trigger == TRIGGER_PREDICTED
 
   def test_test_only_mode_never_changes_speed(self):
     self.params.put_bool("SmartCruiseControlMergeTestOnly", True, block=True)
@@ -452,6 +483,13 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
             lead.x = [num(0., 100., 0.5) for _ in range(rng.choice([0, 1, 6]))]
           leads.append(lead)
         md = make_model(leads, num(-0.003, 0.003, 0.), None if rng.random() < 0.97 else rng.choice([0, 5, 10 ** 9]))
+        if scenario % 2 == 0:
+          add_lanes(md, right_lane_ends=scenario % 4 == 0, left_lane_ends=scenario % 8 == 0, edge_std=num(0., 2., 0.05),
+                    line_prob=num(0., 1., 0.05))
+          if rng.random() < 0.02:
+            md.roadEdges[1].y = [num(-5., 9., 0.3) for _ in md.roadEdges[1].y]
+          if rng.random() < 0.01:
+            md.laneLines[2].x = []
         if rng.random() < 0.01:
           md.position.x = []
         cs = make_car_state(blinker, v_ego)
@@ -467,7 +505,7 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
           assert self.scc.is_active and not self.scc.test_only
           assert MIN_V_TARGET <= out <= v_cruise
           assert out >= self.scc.v_ref - self.scc.max_drop - 1e-6
-          assert out >= self.scc.v_ref - 30 * CV.MPH_TO_MS - 1e-6
+          assert out >= self.scc.v_ref - 40 * CV.MPH_TO_MS - 1e-6
         active_run = active_run + 1 if self.scc.is_active else 0
         longest = max(longest, active_run)
         events += int(self.scc.is_active and not was_active)
@@ -476,3 +514,86 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     assert longest <= int(_MAX_EVENT_TIME / DT_MDL) + 1
     assert events > 15  # the fuzz really did reach the active states
     assert _COOLDOWN_TIME > 0 and _HOLD_TIME > 0 and _LOST_TIME > 0
+
+  # ---------- acting early ----------
+
+  def test_measured_trigger_is_reported(self):
+    self.run_scene(2., lat_speed=0.8, stop_y=1.2)
+    assert self.scc.candidate.trigger == TRIGGER_MEASURED
+
+  def test_slow_car_hugging_our_line_triggers_without_moving(self):
+    # 9 mph slower than us and sitting 2.4 m off our path (on the line), not moving sideways at all.
+    self.run_scene(1., y0=2.4, v=27., lat_speed=0.)
+    assert self.scc.state == MergeState.slowing
+    assert self.scc.candidate.trigger == TRIGGER_ENCROACHING
+
+  def test_slow_car_centered_in_its_lane_is_ignored(self):
+    # Passing a much slower truck that stays in the middle of the next lane, and that lane continues.
+    self.lanes = {}
+    self.run_scene(6., y0=3.6, v=20., lat_speed=0.)
+    assert self.scc.state == MergeState.enabled
+    self.lanes = {'right_lane_ends': False}
+    self.run_scene(6., y0=3.6, v=20., lat_speed=0.)
+    assert self.scc.state == MergeState.enabled
+    assert not self.scc.lane_ending[1.]
+
+  def test_on_ramp_slow_car_triggers_before_it_moves(self):
+    # The situation from the road: we do 65 mph, a car on the on-ramp does 40 mph, still centered in its own lane.
+    self.params.put("SmartCruiseControlMergeMaxDrop", 30, block=True)
+    self.scc = SmartCruiseControlMerge()
+    self.lanes = {'right_lane_ends': True}
+    v_ego, v_other = 65 * CV.MPH_TO_MS, 40 * CV.MPH_TO_MS
+    self.run_scene(1.5, dist=120., y0=3.6, v=v_other, lat_speed=0., v_ego=v_ego, v_cruise=v_ego)
+    assert self.scc.lane_ending[1.]
+    assert self.scc.state == MergeState.slowing
+    assert self.scc.candidate.trigger == TRIGGER_LANE_ENDING
+    # speed is brought down to about theirs (never under the 35 mph floor), not just trimmed a little
+    assert MIN_V_TARGET <= self.scc.output_v_target <= v_other
+
+  def test_lane_ending_with_car_at_our_speed_is_ignored(self):
+    self.lanes = {'right_lane_ends': True}
+    self.run_scene(3., y0=3.6, v=V_EGO, lat_speed=0.)
+    assert self.scc.lane_ending[1.]
+    assert self.scc.state == MergeState.enabled
+
+  def test_lane_ending_needs_confident_road_edge(self):
+    self.lanes = {'right_lane_ends': True, 'edge_std': 2.5}
+    self.run_scene(3., y0=3.6, v=20., lat_speed=0.)
+    assert not self.scc.lane_ending[1.]
+    assert self.scc.state == MergeState.enabled
+
+  def test_left_lane_ending_only_with_both_sides(self):
+    self.lanes = {'left_lane_ends': True}
+    self.run_scene(3., y0=3.6, v=20., lat_speed=0., side=-1.)
+    assert self.scc.lane_ending[-1.]
+    assert self.scc.state == MergeState.enabled
+    self.params.put_bool("SmartCruiseControlMergeBothSides", True, block=True)
+    self.scc = SmartCruiseControlMerge()
+    self.run_scene(3., y0=3.6, v=20., lat_speed=0., side=-1.)
+    assert self.scc.state == MergeState.slowing
+    assert self.scc.candidate.trigger == TRIGGER_LANE_ENDING
+
+  def test_shoulder_is_not_a_lane(self):
+    # No lane on the right at all, just a narrow strip to the road edge.
+    self.lanes = {'right_lane': False}
+    self.run_scene(3., y0=3.6, v=20., lat_speed=0.)
+    assert not self.scc.lane_ending[1.]
+
+  def test_reacts_further_ahead(self):
+    # 4.5 s of travel ahead used to be out of range.
+    self.run_scene(2., dist=V_EGO * 4.5, v=22., lat_speed=0.8, stop_y=1.2)
+    assert self.scc.state == MergeState.slowing
+
+  def test_matches_slower_speed_and_opens_gap(self):
+    self.params.put("SmartCruiseControlMergeMaxDrop", 40, block=True)
+    self.scc = SmartCruiseControlMerge()
+    self.run_scene(2., dist=30., v=24., lat_speed=0.8, stop_y=1.2)
+    # 30 m ahead is about 1 s: aim well under their 24 m/s so the gap grows
+    assert self.scc.output_v_target < 24. - 3.
+
+  def test_debug_slots_are_logged(self):
+    self.run_scene(0.5, y0=3.6, v=27., lat_speed=0., prob=0.1)
+    assert self.scc.state == MergeState.enabled
+    np.testing.assert_allclose(self.scc.debug_prob[0], 0.1, atol=1e-3)
+    np.testing.assert_allclose(self.scc.debug_offset[0], 3.6, atol=1e-3)
+    np.testing.assert_allclose(self.scc.debug_speed[0], 27., atol=1e-3)

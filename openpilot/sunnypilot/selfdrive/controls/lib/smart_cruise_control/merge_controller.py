@@ -7,7 +7,9 @@ See the LICENSE.md file in the root directory for more details.
 Smart Cruise Control - Merge (SCC-Merge)
 
 Watches the driving model's lead outputs for a vehicle that sits in the lane next to ours
-and is moving sideways toward our path (an on-ramp merge or a cut-in). By default only the
+and is about to come into our path (an on-ramp merge or a cut-in). Four things can trigger it:
+measured sideways motion, the model predicting lane entry, a slower vehicle hugging our lane line,
+or a slower vehicle in a lane that ends ahead. By default only the
 right side is watched; the "both sides" setting adds the left. While that is true,
 it lowers the cruise target so the merging vehicle has room to slot in ahead of us.
 
@@ -60,18 +62,37 @@ MAX_V_CRUISE = 50.  # m/s (~112 mph). A set speed above this means "cruise speed
 MIN_V_TARGET = 15.6  # m/s (~35 mph). Never ask for less than this, whatever the settings say.
 
 # --- Which model leads count as "a vehicle merging into our lane" ---
-_LEAD_PROB_TH = 0.5  # model confidence that this vehicle is or will become our lead
+_LEAD_PROB_TH = 0.3  # model confidence that this vehicle is or will become our lead
 _IN_PATH_OFFSET = 0.9  # m. Closer to our path center than this: already in our lane, normal cruise handles it
 _MAX_OFFSET = 4.6  # m. Farther than this: more than one lane away, ignore
 _MIN_DIST = 2.  # m
-_MAX_TIME_GAP = 3.  # s. Ignore vehicles farther ahead than this many seconds of travel
+_MAX_TIME_GAP = 5.  # s. Ignore vehicles farther ahead than this many seconds of travel
 _MIN_MAX_DIST = 30.  # m. Floor for the distance limit above
 _MAX_FASTER = 2.  # m/s. A vehicle pulling away from us faster than this needs no room
 
-_CLOSING_SPEED_TH = 0.3  # m/s. Measured sideways speed toward our path that counts as merging
+_CLOSING_SPEED_TH = 0.2  # m/s. Measured sideways speed toward our path that counts as merging
 _MAX_CLOSING_SPEED = 3.  # m/s. No real vehicle changes lanes faster than this; treat as a glitch
 _PRED_HORIZON_IDX = 1  # index into lead trajectory: the model's prediction 2 s ahead
 _PRED_ENTRY_MIN_MOVE = 0.4  # m. Predicted sideways move needed for the "model predicts lane entry" trigger
+
+# Trigger 3: a clearly slower vehicle that is already close to our lane line. No sideways motion needed.
+_ENCROACH_OFFSET = 2.7  # m from our path center. A vehicle centered in the next lane sits at about 3.6 m
+_ENCROACH_SLOWER = 3.  # m/s. It must be at least this much slower than us
+
+# Trigger 4: the lane next to us ends ahead (on-ramp, lane drop). Whoever is in it has to come over.
+_LANE_END_SLOWER = 1.  # m/s. The vehicle in the ending lane must be at least this much slower than us
+_LANE_END_NEAR_X = 8.  # m ahead. Where we measure the next lane's width "here"
+_LANE_END_FAR_T = 4.  # s of travel ahead. Where we measure it "ahead"
+_LANE_END_FAR_X_LIMITS = (50., 110.)  # m
+_LANE_END_NEAR_WIDTH = (2.5, 6.)  # m. Here, there must be about one lane between our lane line and the road edge
+_LANE_END_FAR_WIDTH = 1.6  # m. Ahead, less than this is left of it
+_LANE_END_MIN_SHRINK = 1.5  # m
+_LANE_END_LINE_PROB = 0.3  # model confidence in our own lane line on that side
+_LANE_END_EDGE_STD = 1.  # m. Model uncertainty of the road edge on that side must be below this
+_LANE_END_TIME = 0.5  # s. The lane must look like it ends for this long
+
+TRIGGER_NONE, TRIGGER_MEASURED, TRIGGER_PREDICTED, TRIGGER_ENCROACHING, TRIGGER_LANE_ENDING = range(5)
+_DEBUG_SLOTS = 3
 
 _CLOSING_FILTER_TAU = 0.4  # s. Low-pass on the measured sideways speed
 _TRACK_JUMP_DIST = 6.  # m. Jump in distance between frames: the model switched to another vehicle
@@ -85,9 +106,9 @@ _SANE_SPEED = 70.  # m/s
 _SANE_ACCEL = 5.  # m/s^2
 
 # --- Timing ---
-_ENTER_TIME = 0.4  # s. A candidate must persist this long before we slow down
+_ENTER_TIME = 0.25  # s. A candidate must persist this long before we slow down
 _LOST_TIME = 0.5  # s. Candidate gone for this long: stop tracking it, start the hold timer
-_HOLD_TIME = 2.  # s. Keep the reduced speed this long after the vehicle is gone or has merged
+_HOLD_TIME = 3.  # s. Keep the reduced speed this long after the vehicle is gone or has merged
 _MAX_EVENT_TIME = 12.  # s. Hard cap on one slowdown, guards against a stuck false detection
 _COOLDOWN_TIME = 3.  # s. Quiet time after an event before a new one may start
 _REARM_TIME = 1.  # s. After an event, no candidate may be seen for this long before a new event
@@ -96,11 +117,11 @@ _BLINKER_SUPPRESS_TIME = 3.  # s. Ignore everything this long after our own turn
 _FAULT_ALERT_TIME = 5.  # s. How long the fault alert is requested
 
 # --- How much to slow ---
-_SPEED_MARGIN = 1.  # m/s. Aim this far below the merging vehicle's speed
-_GAP_EXTRA_V = [3., 0.]  # m/s. Extra slowdown when the vehicle is very close
-_GAP_EXTRA_BP = [1., 3.]  # s. Time gap breakpoints for the above
-_DEFAULT_MAX_DROP_MPH = 20
-_MAX_DROP_LIMITS_MPH = (5, 30)
+_SPEED_MARGIN = 0.5  # m/s. Aim this far below the merging vehicle's speed
+_GAP_EXTRA_V = [5., 2.5, 0.]  # m/s. Extra slowdown to open a gap while the vehicle is close
+_GAP_EXTRA_BP = [1., 2., 3.5]  # s. Time gap breakpoints for the above
+_DEFAULT_MAX_DROP_MPH = 30
+_MAX_DROP_LIMITS_MPH = (5, 40)
 
 
 def _FRAMES(t: float) -> int:
@@ -112,11 +133,12 @@ def _finite(*values: float) -> bool:
 
 
 class MergeCandidate:
-  def __init__(self, dist: float, offset: float, closing_speed: float, v_lead: float):
+  def __init__(self, dist: float, offset: float, closing_speed: float, v_lead: float, trigger: int = TRIGGER_NONE):
     self.dist = dist
     self.offset = offset
     self.closing_speed = closing_speed
     self.v_lead = v_lead
+    self.trigger = trigger
 
 
 class LeadTrack:
@@ -180,6 +202,14 @@ class SmartCruiseControlMerge:
     self.fault = False
     self.fault_frames = 0
 
+    # Kept only for the log, so a drive can be studied afterwards. Never used for control.
+    self.debug_prob = [0.] * _DEBUG_SLOTS
+    self.debug_dist = [0.] * _DEBUG_SLOTS
+    self.debug_offset = [0.] * _DEBUG_SLOTS
+    self.debug_speed = [0.] * _DEBUG_SLOTS
+    self.lane_ending = {1.: False, -1.: False}  # +1 right, -1 left
+    self.lane_ending_frames = {1.: 0, -1.: 0}
+
     self.last_model_frame_id: int | None = None
     self.candidate_frames = 0
     self.lost_frames = 0
@@ -220,6 +250,33 @@ class SmartCruiseControlMerge:
       track.reset()
     self.candidate = None
     self.candidate_frames = 0
+    for side in self.lane_ending:
+      self.lane_ending[side] = False
+      self.lane_ending_frames[side] = 0
+
+  def _update_lane_ending(self, md) -> None:
+    """Does the lane next to ours run out ahead? Compare its width here with its width further on."""
+    far_x = min(max(self.v_ego * _LANE_END_FAR_T, _LANE_END_FAR_X_LIMITS[0]), _LANE_END_FAR_X_LIMITS[1])
+    for side, line_idx, edge_idx in ((1., 2, 1), (-1., 1, 0)):
+      ending = False
+      if (len(md.laneLines) > line_idx and len(md.roadEdges) > edge_idx and len(md.laneLineProbs) > line_idx and
+          len(md.roadEdgeStds) > edge_idx):
+        line, edge = md.laneLines[line_idx], md.roadEdges[edge_idx]
+        lx, ly = np.asarray(line.x, dtype=float), np.asarray(line.y, dtype=float)
+        ex, ey = np.asarray(edge.x, dtype=float), np.asarray(edge.y, dtype=float)
+        line_prob, edge_std = float(md.laneLineProbs[line_idx]), float(md.roadEdgeStds[edge_idx])
+        usable = (len(lx) > 1 and len(lx) == len(ly) and len(ex) > 1 and len(ex) == len(ey) and
+                  bool(np.all(np.isfinite(lx))) and bool(np.all(np.isfinite(ly))) and bool(np.all(np.isfinite(ex))) and
+                  bool(np.all(np.isfinite(ey))) and bool(np.all(np.diff(lx) > 0.)) and bool(np.all(np.diff(ex) > 0.)) and
+                  lx[-1] >= far_x and ex[-1] >= far_x and _finite(line_prob, edge_std) and
+                  line_prob >= _LANE_END_LINE_PROB and 0. <= edge_std < _LANE_END_EDGE_STD)
+        if usable:
+          near = side * float(np.interp(_LANE_END_NEAR_X, ex, ey) - np.interp(_LANE_END_NEAR_X, lx, ly))
+          far = side * float(np.interp(far_x, ex, ey) - np.interp(far_x, lx, ly))
+          ending = (_LANE_END_NEAR_WIDTH[0] < near < _LANE_END_NEAR_WIDTH[1] and far < _LANE_END_FAR_WIDTH and
+                    near - far > _LANE_END_MIN_SHRINK)
+      self.lane_ending_frames[side] = self.lane_ending_frames[side] + 1 if ending else 0
+      self.lane_ending[side] = self.lane_ending_frames[side] >= _FRAMES(_LANE_END_TIME)
 
   def _model_dt(self, md) -> float:
     """Time since the last model frame we used. 0 means this frame is not new: use nothing from it."""
@@ -256,8 +313,11 @@ class SmartCruiseControlMerge:
 
     max_dist = max(self.v_ego * _MAX_TIME_GAP, _MIN_MAX_DIST)
     best: MergeCandidate | None = None
+    self._update_lane_ending(md)
+    for i in range(_DEBUG_SLOTS):
+      self.debug_prob[i] = self.debug_dist[i] = self.debug_offset[i] = self.debug_speed[i] = 0.
 
-    for track, lead in zip(self.tracks, leads, strict=False):
+    for slot, (track, lead) in enumerate(zip(self.tracks, leads, strict=False)):
       if len(lead.x) <= _PRED_HORIZON_IDX or len(lead.y) <= _PRED_HORIZON_IDX or len(lead.v) < 1:
         track.reset()
         continue
@@ -271,7 +331,7 @@ class SmartCruiseControlMerge:
       sane = (_finite(prob, dist, lead_y, pred_dist, pred_y, v_lead) and 0. <= dist < _SANE_DIST and
               abs(lead_y) < _SANE_OFFSET and abs(pred_y) < _SANE_OFFSET and abs(pred_dist) < _SANE_DIST and
               -5. < v_lead < _SANE_SPEED)
-      if not sane or not _LEAD_PROB_TH <= prob <= 1.:
+      if not sane or not 0. <= prob <= 1.:
         track.reset()
         continue
 
@@ -279,12 +339,14 @@ class SmartCruiseControlMerge:
       # Measuring against our path, not straight ahead, keeps this correct in curves.
       offset = lead_y - float(np.interp(dist, path_x, path_y))
       track.update(dist, offset, dt)
+      if slot < _DEBUG_SLOTS:
+        self.debug_prob[slot], self.debug_dist[slot], self.debug_offset[slot], self.debug_speed[slot] = prob, dist, offset, v_lead
 
       on_watched_side = self.both_sides or offset * MERGE_SIDE > 0.
       in_next_lane = _IN_PATH_OFFSET < abs(offset) < _MAX_OFFSET
       in_range = _MIN_DIST < dist < max_dist
       needs_room = v_lead < self.v_ego + _MAX_FASTER
-      if not (on_watched_side and in_next_lane and in_range and needs_room):
+      if not (prob >= _LEAD_PROB_TH and on_watched_side and in_next_lane and in_range and needs_room):
         continue
 
       # Trigger 1: we measure it moving sideways toward us, at a speed a real vehicle could have.
@@ -294,8 +356,16 @@ class SmartCruiseControlMerge:
       pred_offset = pred_y - float(np.interp(pred_dist, path_x, path_y))
       predicted = abs(pred_offset) < _IN_PATH_OFFSET and (abs(offset) - abs(pred_offset)) > _PRED_ENTRY_MIN_MOVE
 
-      if (measured or predicted) and (best is None or dist < best.dist):
-        best = MergeCandidate(dist, offset, track.closing_speed, v_lead)
+      # Trigger 3: clearly slower than us and already close to our lane line.
+      encroaching = abs(offset) < _ENCROACH_OFFSET and v_lead < self.v_ego - _ENCROACH_SLOWER
+
+      # Trigger 4: its lane ends ahead, so it has to come over, and it is slower than us.
+      lane_ending = self.lane_ending[1. if offset > 0. else -1.] and v_lead < self.v_ego - _LANE_END_SLOWER
+
+      trigger = (TRIGGER_MEASURED if measured else TRIGGER_PREDICTED if predicted else
+                 TRIGGER_ENCROACHING if encroaching else TRIGGER_LANE_ENDING if lane_ending else TRIGGER_NONE)
+      if trigger != TRIGGER_NONE and (best is None or dist < best.dist):
+        best = MergeCandidate(dist, offset, track.closing_speed, v_lead, trigger)
 
     return best
 
@@ -325,6 +395,8 @@ class SmartCruiseControlMerge:
     else:
       if not watching:
         self._reset_tracking()
+      for i in range(_DEBUG_SLOTS):
+        self.debug_prob[i] = self.debug_dist[i] = self.debug_offset[i] = self.debug_speed[i] = 0.
       # Not watching, or no new model frame: we have learned nothing new, so there is no candidate.
       self.candidate = None
 
@@ -446,6 +518,9 @@ class SmartCruiseControlMerge:
     # Last line of defence. Whatever happened above, only a sane number may leave this controller.
     if not _finite(v, self.v_cruise_setpoint) or not MIN_V_TARGET < self.v_cruise_setpoint < MAX_V_CRUISE:
       return V_CRUISE_UNSET
+    # The drop limit can be changed in settings while an event is running. Always honour the current one.
+    if _finite(self.v_ref, self.max_drop):
+      v = max(v, self.v_ref - self.max_drop)
     if v < MIN_V_TARGET or v > self.v_cruise_setpoint:
       return V_CRUISE_UNSET
 
