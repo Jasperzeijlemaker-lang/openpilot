@@ -21,7 +21,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.merge_controller import SmartCruiseControlMerge, \
   MIN_V_HIGHWAY, MIN_V_TARGET, _HOLD_TIME, _LOST_TIME, _MAX_EVENT_TIME, _COOLDOWN_TIME, _REARM_TIME, \
   _TIMEOUT_LOCKOUT_TIME, _FAULT_ALERT_TIME, _MAX_FRAME_GAP, TRIGGER_MEASURED, TRIGGER_PREDICTED, TRIGGER_ENCROACHING, \
-  TRIGGER_LANE_ENDING
+  TRIGGER_LANE_ENDING, TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW, _RADAR_PASS_DELTA
 from openpilot.common.test import OpenpilotTestCase
 
 MergeState = custom.LongitudinalPlanSP.SmartCruiseControl.MergeState
@@ -82,6 +82,18 @@ def add_lanes(md, right_lane_ends: bool = False, left_lane_ends: bool = False, r
   md.roadEdges = [xy(edge(-1., left_lane, left_lane_ends)), xy(edge(1., right_lane, right_lane_ends))]
   md.roadEdgeStds = [edge_std, edge_std]
   return md
+
+
+def make_radar(points):
+  """points: (slot, metres ahead, metres to the RIGHT of straight ahead, speed over the ground in m/s, our speed)."""
+  msg = custom.CarStateSP.new_message()
+  tracks = msg.init('mergeRadarTracks', len(points))
+  for track, (slot, dist, right, v_obj, v_ego) in zip(tracks, points, strict=True):
+    track.slot = slot
+    track.dRel = dist
+    track.yRel = -right  # the radar counts left as positive
+    track.vRel = v_obj - v_ego
+  return msg
 
 
 def make_car_state(blinker: bool = False, v_ego: float = V_EGO):
@@ -397,13 +409,16 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     stuck(1.)
     assert self.scc.state == MergeState.slowing
 
-  def test_rearm_needed_between_events(self):
+  def test_cooldown_between_events(self):
     self.run_scene(2., lat_speed=0.8, stop_y=1.2)
     assert self.scc.state == MergeState.slowing
     self.run_scene(0.1, lat_speed=0., override=True)
     self.run_scene(0.1, lat_speed=0.)
     assert self.scc.state == MergeState.enabled
-    assert self.scc.cooldown_frames > 0 and not self.scc.armed
+    # a normal end only needs the short cooldown; the stricter "road must look clear" rule is for cut-off events
+    assert self.scc.cooldown_frames > 0 and self.scc.armed
+    self.run_scene(0.5, lat_speed=0.8, y0=3.6, stop_y=1.2)
+    assert self.scc.state == MergeState.enabled
 
   def test_never_below_absolute_floor(self):
     self.params.put("SmartCruiseControlMergeMaxDrop", 30, block=True)
@@ -493,7 +508,13 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
         if rng.random() < 0.01:
           md.position.x = []
         cs = make_car_state(blinker, v_ego)
-        self.scc.update({'modelV2': md, 'carState': cs}, long_enabled, override, v_ego, num(-3., 3.), v_cruise)
+        sm_fuzz: Any = {'modelV2': md, 'carState': cs}
+        if scenario % 5 != 0:
+          pts = [(rng.randrange(32), num(0., 180.), num(-10., 10.), num(-5., 45.), num(0., 45.)) for _ in range(rng.choice([0, 3, 12, 32]))]
+          if scenario % 3 == 1:
+            pts.append((1, max(5., 120. - i * 0.6), 6.6, 18., 30.))
+          sm_fuzz['carStateSP'] = make_radar(pts)
+        self.scc.update(sm_fuzz, long_enabled, override, v_ego, num(-3., 3.), v_cruise)
 
         out = self.scc.output_v_target
         assert not self.scc.fault
@@ -597,3 +618,127 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     np.testing.assert_allclose(self.scc.debug_prob[0], 0.1, atol=1e-3)
     np.testing.assert_allclose(self.scc.debug_offset[0], 3.6, atol=1e-3)
     np.testing.assert_allclose(self.scc.debug_speed[0], 27., atol=1e-3)
+
+  # ---------- the car's own radar ----------
+
+  def run_radar(self, seconds: float, objects, v_ego: float = V_EGO, v_cruise: float = V_CRUISE, curvature: float = 0., noise: float = 0.,
+                seed: int = 0):
+    """objects: list of dicts(slot, dist, right, v, lat_speed [m/s toward us], stop). Positions advance with time."""
+    rng = random.Random(seed)
+    objs = [dict(o) for o in objects]
+    cs = make_car_state(self.blinker, v_ego)
+    for _ in range(int(seconds / DT_MDL)):
+      points = []
+      for o in objs:
+        path_y = 0.5 * curvature * o['dist'] ** 2
+        points.append((o['slot'], o['dist'], o['right'] + path_y + rng.uniform(-noise, noise), o['v'], v_ego))
+        o['dist'] = max(1., o['dist'] + (o['v'] - v_ego) * DT_MDL)
+        if 'lat_speed' in o:
+          step = o['lat_speed'] * DT_MDL
+          o['right'] = max(o.get('stop', 0.), o['right'] - step) if o['right'] > 0 else min(-o.get('stop', 0.), o['right'] + step)
+      sm: Any = {'modelV2': make_model([], curvature), 'carState': cs, 'carStateSP': make_radar(points)}
+      self.scc.update(sm, True, False, v_ego, 0., v_cruise)
+      self.check_output(v_cruise)
+
+  def test_radar_slow_queue_on_the_right(self):
+    # The recorded on-ramp: we do 69 mph, a line of cars two lanes to the right does 41 mph, 110 m ahead, not moving over yet.
+    self.params.put("SmartCruiseControlMergeMaxDrop", 30, block=True)
+    self.scc = SmartCruiseControlMerge()
+    v_ego, v_q = 69 * CV.MPH_TO_MS, 41 * CV.MPH_TO_MS
+    self.run_radar(1., [{'slot': 1, 'dist': 110., 'right': 6.6, 'v': v_q}, {'slot': 10, 'dist': 135., 'right': 6.8, 'v': v_q}], v_ego=v_ego, v_cruise=v_ego)
+    assert self.scc.state == MergeState.slowing
+    assert self.scc.candidate.trigger == TRIGGER_RADAR_SLOW
+    assert self.scc.radar_objects == 2
+    # defensive: pass them at most 15 mph faster
+    np.testing.assert_allclose(self.scc.output_v_target, v_q + _RADAR_PASS_DELTA, atol=0.05)
+
+  def test_radar_passing_a_slightly_slower_truck_is_ignored(self):
+    # 10 mph slower in the next lane and holding its lane: ordinary passing, no slowdown.
+    self.run_radar(6., [{'slot': 3, 'dist': 90., 'right': 3.6, 'v': V_EGO - 10 * CV.MPH_TO_MS}])
+    assert self.scc.state == MergeState.enabled
+    assert self.scc.radar_objects == 1
+
+  def test_radar_vehicle_moving_into_our_lane(self):
+    self.run_radar(3., [{'slot': 5, 'dist': 45., 'right': 3.6, 'v': V_EGO - 2., 'lat_speed': 0.7, 'stop': 1.5}])
+    assert self.scc.state == MergeState.slowing
+    assert self.scc.candidate.trigger == TRIGGER_RADAR_CONVERGING
+    assert self.scc.output_v_target < V_EGO - 2.
+
+  def test_radar_faster_vehicle_moving_in_is_ignored(self):
+    self.params.put_bool("SmartCruiseControlMergeBothSides", True, block=True)
+    self.scc = SmartCruiseControlMerge()
+    self.run_radar(4., [{'slot': 5, 'dist': 20., 'right': -3.6, 'v': V_EGO + 3., 'lat_speed': 0.7, 'stop': 1.5}])
+    assert self.scc.state == MergeState.enabled
+
+  def test_radar_noisy_sideways_reading_does_not_trigger(self):
+    # A car holding the next lane, with the kind of jitter a radar has. Several seeds, 20 s each.
+    for seed in range(5):
+      self.scc = SmartCruiseControlMerge()
+      self.run_radar(20., [{'slot': 4, 'dist': 60., 'right': 3.6, 'v': V_EGO - 1.}], noise=0.3, seed=seed)
+      assert self.scc.state == MergeState.enabled, seed
+
+  def test_radar_standing_objects_are_ignored(self):
+    # Signs and barriers: not moving over the ground.
+    self.run_radar(3., [{'slot': 2, 'dist': 120., 'right': 5., 'v': 0.}, {'slot': 6, 'dist': 80., 'right': 3., 'v': 1.}])
+    assert self.scc.state == MergeState.enabled
+    assert self.scc.radar_objects == 0
+
+  def test_radar_vehicle_in_our_own_lane_is_left_to_stock_cruise(self):
+    self.run_radar(2., [{'slot': 2, 'dist': 90., 'right': 0.3, 'v': 15.}])
+    assert self.scc.state == MergeState.enabled
+
+  def test_radar_left_side_needs_both_sides(self):
+    queue = [{'slot': 1, 'dist': 100., 'right': -6.6, 'v': 17.}]
+    self.run_radar(1.5, queue)
+    assert self.scc.state == MergeState.enabled
+    self.params.put_bool("SmartCruiseControlMergeBothSides", True, block=True)
+    self.scc = SmartCruiseControlMerge()
+    self.run_radar(1.5, queue)
+    assert self.scc.state == MergeState.slowing
+
+  def test_radar_far_side_lanes_are_ignored(self):
+    # Three lanes over.
+    self.run_radar(3., [{'slot': 1, 'dist': 100., 'right': 11., 'v': 15.}])
+    assert self.scc.state == MergeState.enabled
+
+  def test_radar_works_in_a_curve(self):
+    # A car holding the next lane through a bend sits off to the side of "straight ahead" but not of our path.
+    self.run_radar(8., [{'slot': 4, 'dist': 70., 'right': 3.6, 'v': V_EGO - 0.5}], curvature=0.002)
+    assert self.scc.state == MergeState.enabled
+
+  def test_radar_slot_reuse_is_not_motion(self):
+    # The radar hands slot 9 to a different vehicle every few frames. That must never look like a sideways move.
+    cs = make_car_state(False, V_EGO)
+    for i in range(int(6. / DT_MDL)):
+      right = 3.6 if (i // 4) % 2 == 0 else 2.2
+      dist = 50. if (i // 4) % 2 == 0 else 80.
+      sm: Any = {'modelV2': make_model([]), 'carState': cs, 'carStateSP': make_radar([(9, dist, right, V_EGO - 1., V_EGO)])}
+      self.scc.update(sm, True, False, V_EGO, 0., V_CRUISE)
+    assert self.scc.state == MergeState.enabled
+
+  def test_radar_bad_numbers(self):
+    cs = make_car_state(False, V_EGO)
+    for bad in (float('nan'), float('inf'), -1e30, 1e30):
+      self.scc = SmartCruiseControlMerge()
+      for _ in range(40):
+        msg = make_radar([(1, 100., 6.6, 17., V_EGO), (2, 60., 3.6, V_EGO, V_EGO)])
+        msg.mergeRadarTracks[0].dRel = bad
+        msg.mergeRadarTracks[1].yRel = bad
+        self.scc.update({'modelV2': make_model([]), 'carState': cs, 'carStateSP': msg}, True, False, V_EGO, 0., V_CRUISE)
+        self.check_output()
+      assert not self.scc.fault and self.scc.state == MergeState.enabled
+
+  def test_radar_test_only(self):
+    self.params.put_bool("SmartCruiseControlMergeTestOnly", True, block=True)
+    self.scc = SmartCruiseControlMerge()
+    self.run_radar(1.5, [{'slot': 1, 'dist': 100., 'right': 6.6, 'v': 17.}])
+    assert self.scc.state == MergeState.slowing
+    assert self.scc.output_v_target == V_CRUISE_UNSET
+
+  def test_long_queue_is_not_cut_off_early(self):
+    # Passing a long slow queue takes a while. The slowdown must hold for its whole length.
+    queue = [{'slot': k, 'dist': 60. + 25. * k, 'right': 6.6, 'v': 15.} for k in range(20)]
+    for second in range(20):
+      self.run_radar(1., [dict(q, dist=q['dist'] - 16. * second) for q in queue if q['dist'] - 16. * second > 5.])
+      if second >= 1:
+        assert self.scc.is_active, second

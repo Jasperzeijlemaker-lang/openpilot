@@ -35,6 +35,7 @@ Failsafes, in the order they apply:
   7. Gas pedal, cruise off, our own turn signal, low speed, or the toggle going off all cancel at once.
 """
 import math
+from collections import deque
 
 import numpy as np
 
@@ -92,6 +93,29 @@ _LANE_END_EDGE_STD = 1.  # m. Model uncertainty of the road edge on that side mu
 _LANE_END_TIME = 0.5  # s. The lane must look like it ends for this long
 
 TRIGGER_NONE, TRIGGER_MEASURED, TRIGGER_PREDICTED, TRIGGER_ENCROACHING, TRIGGER_LANE_ENDING = range(5)
+TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW = 5, 6
+
+# --- The car's own radar (when it reports its object list, see sunnypilot/selfdrive/car/merge_radar.py) ---
+# Unlike the camera model, the radar reports vehicles in the lanes beside us. Two things are acted on:
+#   converging: a vehicle beside us is moving sideways toward our path           -> make room, match its speed
+#   slow:       vehicles beside us are much slower than us (a queue, an on-ramp) -> defensive: limit how fast we pass them
+_RADAR_MIN_OBJ_SPEED = 4.  # m/s. Slower than this over the ground: a sign, a barrier, a parked car. Ignore
+_RADAR_MIN_DIST = 4.  # m
+_RADAR_MAX_DIST = 160.  # m
+_RADAR_IN_PATH_OFFSET = 1.3  # m. Closer to our path than this: in our lane, the stock cruise handles it
+_RADAR_MAX_OFFSET = 8.5  # m. About two lanes to the side. An on-ramp usually starts that far out
+_RADAR_CONVERGE_MAX_OFFSET = 4.5  # m. A sideways move only counts for a vehicle in the lane next to ours
+_RADAR_CONVERGE_MAX_DIST = 90.  # m. Beyond this the radar's sideways reading is too noisy to trust a move
+_RADAR_CONVERGE_SPEED = (0.25, 3.)  # m/s toward our path, right now
+_RADAR_CONVERGE_WINDOW = 1.5  # s. ...and it must have come this much closer over this long:
+_RADAR_CONVERGE_MOVE = 0.75  # m
+_RADAR_CONVERGE_AVG = 5  # readings averaged at each end of the window, so one jittery reading cannot fake a move
+_RADAR_CONVERGE_MAX_FASTER = 0.5  # m/s. A vehicle faster than us needs no room
+_RADAR_CONFIRM_TIME = 0.4  # s. A radar object must be tracked this long before it counts
+_RADAR_PASS_DELTA = 15. * CV.MPH_TO_MS  # Defensive mode: never pass vehicles beside us more than this much faster
+_RADAR_SLOW_TTC = 10.  # s. Defensive mode starts when we would reach the slow vehicle within this time
+_RADAR_SLOW_MIN_DELTA = 2.  # m/s over the pass limit before defensive mode reacts at all
+_RADAR_TRACK_JUMP_DIST = 4.  # m between frames: the radar reused the slot for another object
 _DEBUG_SLOTS = 3
 
 _CLOSING_FILTER_TAU = 0.4  # s. Low-pass on the measured sideways speed
@@ -109,7 +133,7 @@ _SANE_ACCEL = 5.  # m/s^2
 _ENTER_TIME = 0.25  # s. A candidate must persist this long before we slow down
 _LOST_TIME = 0.5  # s. Candidate gone for this long: stop tracking it, start the hold timer
 _HOLD_TIME = 3.  # s. Keep the reduced speed this long after the vehicle is gone or has merged
-_MAX_EVENT_TIME = 12.  # s. Hard cap on one slowdown, guards against a stuck false detection
+_MAX_EVENT_TIME = 40.  # s. Hard cap on one slowdown, guards against a stuck false detection
 _COOLDOWN_TIME = 3.  # s. Quiet time after an event before a new one may start
 _REARM_TIME = 1.  # s. After an event, no candidate may be seen for this long before a new event
 _TIMEOUT_LOCKOUT_TIME = 30.  # s. Quiet time after an event that hit _MAX_EVENT_TIME
@@ -139,6 +163,14 @@ class MergeCandidate:
     self.closing_speed = closing_speed
     self.v_lead = v_lead
     self.trigger = trigger
+
+  def wanted_speed(self, v_ego: float) -> float:
+    if self.trigger == TRIGGER_RADAR_SLOW:
+      # Defensive: keep passing, but not much faster than the vehicles beside us.
+      return self.v_lead + _RADAR_PASS_DELTA
+    # Make room: a little under its speed, lower still while it is close so the gap grows.
+    time_gap = self.dist / max(v_ego, 0.1)
+    return self.v_lead - _SPEED_MARGIN - float(np.interp(time_gap, _GAP_EXTRA_BP, _GAP_EXTRA_V))
 
 
 class LeadTrack:
@@ -170,6 +202,43 @@ class LeadTrack:
 
     self.dist = dist
     self.offset = offset
+
+
+class RadarTrack:
+  """One radar slot: how long we have seen the same object and how fast it moves sideways toward our path."""
+
+  def __init__(self):
+    self.frames = 0
+    self.dist = 0.
+    self.offset = 0.
+    self.closing_speed = 0.
+    self.updated = False
+    self.history: deque[float] = deque(maxlen=_FRAMES(_RADAR_CONVERGE_WINDOW) + 1)  # |offset|, one per model frame
+
+  def update(self, dist: float, offset: float, dt: float) -> None:
+    same = self.frames > 0 and dt > 0. and abs(dist - self.dist) < _RADAR_TRACK_JUMP_DIST and abs(offset - self.offset) < _TRACK_JUMP_OFFSET
+    if not same:
+      self.frames = 1
+      self.closing_speed = 0.
+      self.history.clear()
+    else:
+      self.frames += 1
+      raw = (abs(self.offset) - abs(offset)) / dt
+      alpha = dt / (_CLOSING_FILTER_TAU + dt)
+      self.closing_speed += alpha * (raw - self.closing_speed)
+    self.dist = dist
+    self.offset = offset
+    self.history.append(abs(offset))
+    self.updated = True
+
+  @property
+  def moved_closer(self) -> float:
+    """How much closer to our path it is now than a full window ago. 0 until we have watched it that long."""
+    if len(self.history) < self.history.maxlen:
+      return 0.
+    values = list(self.history)
+    n = _RADAR_CONVERGE_AVG
+    return sum(values[:n]) / n - sum(values[-n:]) / n
 
 
 class SmartCruiseControlMerge:
@@ -208,6 +277,8 @@ class SmartCruiseControlMerge:
     self.debug_offset = [0.] * _DEBUG_SLOTS
     self.debug_speed = [0.] * _DEBUG_SLOTS
     self.lane_ending = {1.: False, -1.: False}  # +1 right, -1 left
+    self.radar_tracks: dict[int, RadarTrack] = {}
+    self.radar_objects = 0
     self.lane_ending_frames = {1.: 0, -1.: 0}
 
     self.last_model_frame_id: int | None = None
@@ -250,6 +321,8 @@ class SmartCruiseControlMerge:
       track.reset()
     self.candidate = None
     self.candidate_frames = 0
+    self.radar_tracks = {}
+    self.radar_objects = 0
     for side in self.lane_ending:
       self.lane_ending[side] = False
       self.lane_ending_frames[side] = 0
@@ -369,6 +442,68 @@ class SmartCruiseControlMerge:
 
     return best
 
+  def _find_radar_candidate(self, sm: messaging.SubMaster, md, dt: float) -> MergeCandidate | None:
+    """Vehicles beside our lane, from the car's own radar. Returns the one that asks for the lowest speed."""
+    try:
+      points = sm['carStateSP'].mergeRadarTracks
+    except (KeyError, AttributeError):
+      return None
+
+    path_x = np.asarray(md.position.x, dtype=float)
+    path_y = np.asarray(md.position.y, dtype=float)
+    if not (len(path_x) > 1 and len(path_x) == len(path_y) and bool(np.all(np.isfinite(path_x))) and
+            bool(np.all(np.isfinite(path_y))) and bool(np.all(np.diff(path_x) > 0.))):
+      self.radar_tracks = {}
+      self.radar_objects = 0
+      return None
+
+    for track in self.radar_tracks.values():
+      track.updated = False
+
+    max_dist = min(max(self.v_ego * _MAX_TIME_GAP, _MIN_MAX_DIST), _RADAR_MAX_DIST)
+    best: MergeCandidate | None = None
+    best_wanted = float('inf')
+    beside = 0
+
+    for point in points:
+      slot, dist, y_left, v_rel = int(point.slot), float(point.dRel), float(point.yRel), float(point.vRel)
+      v_obj = self.v_ego + v_rel
+      if not (_finite(dist, y_left, v_rel) and _RADAR_MIN_DIST < dist < _SANE_DIST and abs(y_left) < _SANE_OFFSET and
+              _RADAR_MIN_OBJ_SPEED < v_obj < _SANE_SPEED):
+        continue
+
+      # The radar measures straight ahead of the car. Our path may curve, so measure from the path. Positive = right.
+      offset = -y_left - float(np.interp(dist, path_x, path_y))
+      track = self.radar_tracks.setdefault(slot, RadarTrack())
+      track.update(dist, offset, dt)
+
+      if not _RADAR_IN_PATH_OFFSET < abs(offset) < _RADAR_MAX_OFFSET:
+        continue
+      if not (self.both_sides or offset * MERGE_SIDE > 0.):
+        continue
+      if track.frames < _FRAMES(_RADAR_CONFIRM_TIME):
+        continue
+      beside += 1
+      if dist > max_dist:
+        continue
+
+      closing = self.v_ego - v_obj  # how fast we catch up with it
+      converging = (abs(offset) < _RADAR_CONVERGE_MAX_OFFSET and dist < _RADAR_CONVERGE_MAX_DIST and
+                    v_obj < self.v_ego + _RADAR_CONVERGE_MAX_FASTER and
+                    _RADAR_CONVERGE_SPEED[0] < track.closing_speed < _RADAR_CONVERGE_SPEED[1] and
+                    track.moved_closer > _RADAR_CONVERGE_MOVE)
+      slow = closing > _RADAR_PASS_DELTA + _RADAR_SLOW_MIN_DELTA and dist / closing < _RADAR_SLOW_TTC
+
+      if converging or slow:
+        candidate = MergeCandidate(dist, offset, track.closing_speed, v_obj, TRIGGER_RADAR_CONVERGING if converging else TRIGGER_RADAR_SLOW)
+        wanted = candidate.wanted_speed(self.v_ego)
+        if wanted < best_wanted:
+          best, best_wanted = candidate, wanted
+
+    self.radar_tracks = {slot: track for slot, track in self.radar_tracks.items() if track.updated}
+    self.radar_objects = min(beside, 255)
+    return best
+
   def _update_calculations(self, sm: messaging.SubMaster) -> None:
     self.cooldown_frames = max(0, self.cooldown_frames - 1)
     self.blinker_frames = max(0, self.blinker_frames - 1)
@@ -391,7 +526,13 @@ class SmartCruiseControlMerge:
                 MIN_V_HIGHWAY <= self.v_ego < _SANE_SPEED and self.blinker_frames == 0)
 
     if watching and dt > 0.:
-      self.candidate = self._find_candidate(md, dt)
+      camera = self._find_candidate(md, dt)
+      radar = self._find_radar_candidate(sm, md, dt)
+      # Whichever asks for the lower speed wins.
+      if camera is not None and radar is not None:
+        self.candidate = camera if camera.wanted_speed(self.v_ego) <= radar.wanted_speed(self.v_ego) else radar
+      else:
+        self.candidate = camera if camera is not None else radar
     else:
       if not watching:
         self._reset_tracking()
@@ -423,8 +564,10 @@ class SmartCruiseControlMerge:
     self.hold_frames = 0
     self.v_target = V_CRUISE_UNSET
     if was_active:
-      self.armed = False
-      self.clear_frames = 0
+      # Only an event that had to be cut off needs the road to look clear again before the next one.
+      if timed_out:
+        self.armed = False
+        self.clear_frames = 0
       self.cooldown_frames = max(self.cooldown_frames, _FRAMES(_TIMEOUT_LOCKOUT_TIME if timed_out else _COOLDOWN_TIME))
 
   def _update_state_machine(self) -> tuple[bool, bool]:
@@ -500,8 +643,7 @@ class SmartCruiseControlMerge:
       return
 
     if self.state == MergeState.slowing and self.candidate is not None:
-      time_gap = self.candidate.dist / max(self.v_ego, 0.1)
-      wanted = self.candidate.v_lead - _SPEED_MARGIN - float(np.interp(time_gap, _GAP_EXTRA_BP, _GAP_EXTRA_V))
+      wanted = self.candidate.wanted_speed(self.v_ego)
       # Lowest speed we may ask for: the configured drop below where we started, and never under the absolute floor.
       floor = max(self.v_ref - self.max_drop, MIN_V_TARGET)
       ceiling = self.v_cruise_setpoint

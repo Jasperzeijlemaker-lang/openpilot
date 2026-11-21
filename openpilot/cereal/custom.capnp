@@ -258,7 +258,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
       leadClosingSpeed @9 :Float32; # m/s, sideways speed toward our path.
       leadSpeed @10 :Float32; # m/s, speed of the merging vehicle.
       fault @11 :Bool; # The controller hit an unexpected error and switched itself off until restart.
-      trigger @12 :UInt8; # Why the current candidate counts: 1 sideways motion, 2 model prediction, 3 slow and close to our line, 4 its lane ends.
+      trigger @12 :UInt8; # Why the current candidate counts: 1 sideways motion, 2 model prediction, 3 slow and close to our line, 4 its lane ends, 5 radar: moving into our lane, 6 radar: slow traffic beside us.
       rightLaneEnding @13 :Bool; # The lane on our right looks like it runs out ahead.
       leftLaneEnding @14 :Bool;
       # Raw view of the model's three lead slots, before any threshold. For studying a drive afterwards.
@@ -266,6 +266,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
       leadsDistance @16 :List(Float32);
       leadsLateralOffset @17 :List(Float32);
       leadsSpeed @18 :List(Float32);
+      radarObjects @19 :UInt8; # How many moving vehicles the car's radar reports beside our lane.
     }
 
     enum MergeState {
@@ -489,6 +490,14 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
 
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
+  mergeRadarTracks @1 :List(MergeRadarTrack); # Raw front radar objects, for Smart Cruise Control - Merge only.
+
+  struct MergeRadarTrack {
+    slot @0 :UInt8;
+    dRel @1 :Float32; # m ahead
+    yRel @2 :Float32; # m, positive is left
+    vRel @3 :Float32; # m/s, negative means we are catching up
+  }
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

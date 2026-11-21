@@ -133,6 +133,7 @@ class LongitudinalPlannerSP:
     sccMerge.leadsDistance = [float(v) for v in merge.debug_dist]
     sccMerge.leadsLateralOffset = [float(v) for v in merge.debug_offset]
     sccMerge.leadsSpeed = [float(v) for v in merge.debug_speed]
+    sccMerge.radarObjects = int(merge.radar_objects)
 
     # Speed Limit
     speedLimit = longitudinalPlanSP.speedLimit

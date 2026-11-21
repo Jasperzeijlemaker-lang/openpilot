@@ -19,6 +19,7 @@ from opendbc.car.fw_versions import ObdCallback
 from opendbc.car.car_helpers import get_car, interfaces
 from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
+from openpilot.sunnypilot.selfdrive.car.merge_radar import MergeRadar
 from openpilot.selfdrive.car.cruise import VCruiseHelper
 from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_capnp
 
@@ -73,6 +74,7 @@ class Car:
     self.can_sock = messaging.sub_sock('can', timeout=20)
     self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP'])
     self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'radarTracks'] + ['carParamsSP', 'carStateSP'])
+    self.merge_radar = MergeRadar()
 
     self.can_rcv_cum_timeout_counter = 0
 
@@ -196,6 +198,9 @@ class Car:
     # Update radar tracks from CAN
     RD: structs.RadarDataT | None = self.RI.update(can_list)
 
+    # Read-only copy of the radar's object list for Smart Cruise Control - Merge. Guards itself against errors.
+    self.merge_radar.update(can_list)
+
     self.sm.update(0)
 
     can_rcv_valid = len(can_strs) > 0
@@ -259,6 +264,7 @@ class Car:
     cs_sp_send = messaging.new_message('carStateSP')
     cs_sp_send.valid = CS.canValid
     cs_sp_send.carStateSP = CS_SP
+    self.merge_radar.fill(cs_sp_send.carStateSP)
     self.pm.send('carStateSP', cs_sp_send)
 
   def controls_update(self, CS: car.CarState, CC: car.CarControl, CC_SP: custom.CarControlSP):
