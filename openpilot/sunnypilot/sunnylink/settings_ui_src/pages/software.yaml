@@ -18,3 +18,17 @@ sections:
     enablement:
     - $ref: '#/macros/offroad'
     - $ref: '#/macros/advanced_only'
+- id: remote_update
+  title: Update From Here
+  description: Update the device without going to the car
+  items:
+  - key: RemoteUpdateNow
+    widget: toggle
+    title: Update Now
+    description: Downloads the newest version and restarts the device to install it. Only works with the car off and the device on Wi-Fi. Turns itself off when done.
+    enablement:
+    - $ref: '#/macros/offroad'
+  - key: RemoteUpdateStatus
+    widget: info
+    title: Update Status
+    blocked: true

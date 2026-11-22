@@ -112,6 +112,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"PrimeType", {PERSISTENT, INT}},
     {"RecordAudio", {PERSISTENT | BACKUP, BOOL}},
     {"RecordFront", {PERSISTENT | BACKUP, BOOL}},
+    {"RemoteUpdateNow", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL, "0"}},
+    {"RemoteUpdateStatus", {CLEAR_ON_MANAGER_START, STRING}},
     {"RecordFrontLock", {PERSISTENT, BOOL}},  // for the internal fleet
     {"SecOCKey", {PERSISTENT | DONT_LOG | BACKUP, STRING}},
     {"ShowDebugInfo", {PERSISTENT, BOOL}},
