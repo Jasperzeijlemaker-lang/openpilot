@@ -53,6 +53,8 @@ class LongitudinalPlannerSP:
       self.events_sp.add(EventNameSP.mergeAssistFault)
     elif self.scc.merge.state == MergeState.slowing:
       self.events_sp.add(EventNameSP.mergeAssistTest if self.scc.merge.test_only else EventNameSP.mergeAssistSlowing)
+    elif self.scc.exit_watch.split:
+      self.events_sp.add(EventNameSP.exitWatchTest)
 
     # Speed Limit Resolver
     self.resolver.update(v_ego, sm)
@@ -134,6 +136,13 @@ class LongitudinalPlannerSP:
     sccMerge.leadsLateralOffset = [float(v) for v in merge.debug_offset]
     sccMerge.leadsSpeed = [float(v) for v in merge.debug_speed]
     sccMerge.radarObjects = int(merge.radar_objects)
+    exit_watch = self.scc.exit_watch
+    sccMerge.exitSplit = bool(exit_watch.split)
+    sccMerge.exitFollowing = bool(exit_watch.following)
+    sccMerge.exitSide = int(exit_watch.side)
+    sccMerge.exitDrift = float(exit_watch.drift)
+    sccMerge.exitLeadDistance = float(exit_watch.lead_dist)
+    sccMerge.exitLaneWidening = float(exit_watch.lane_widening)
 
     # Speed Limit
     speedLimit = longitudinalPlanSP.speedLimit

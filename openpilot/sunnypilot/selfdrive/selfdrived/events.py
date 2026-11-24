@@ -249,6 +249,14 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
   },
 
+  EventNameSP.exitWatchTest: {
+    ET.WARNING: Alert(
+      "Car ahead is taking the exit (watch only)",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
+  },
+
   EventNameSP.mergeAssistFault: {
     ET.WARNING: Alert(
       "Merge assist turned itself off",

@@ -267,6 +267,13 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
       leadsLateralOffset @17 :List(Float32);
       leadsSpeed @18 :List(Float32);
       radarObjects @19 :UInt8; # How many moving vehicles the car's radar reports beside our lane.
+      # Exit Watch (watch only, changes nothing): our lane splits and the vehicle ahead takes the other branch.
+      exitSplit @20 :Bool;
+      exitFollowing @21 :Bool; # ...and our planned path drifts after it.
+      exitSide @22 :Int8; # +1 the other branch goes right, -1 left.
+      exitDrift @23 :Float32; # m, planned path off the lane centre toward that side.
+      exitLeadDistance @24 :Float32;
+      exitLaneWidening @25 :Float32; # m
     }
 
     enum MergeState {
@@ -397,6 +404,7 @@ struct OnroadEventSP @0xda96579883444c35 {
     mergeAssistSlowing @26;
     mergeAssistTest @27;
     mergeAssistFault @28;
+    exitWatchTest @29;
   }
 }
 
