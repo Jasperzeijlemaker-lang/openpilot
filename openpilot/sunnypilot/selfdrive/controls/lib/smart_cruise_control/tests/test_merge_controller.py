@@ -21,7 +21,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.merge_controller import SmartCruiseControlMerge, \
   MIN_V_HIGHWAY, MIN_V_TARGET, _HOLD_TIME, _LOST_TIME, _MAX_EVENT_TIME, _COOLDOWN_TIME, _REARM_TIME, \
   _TIMEOUT_LOCKOUT_TIME, _FAULT_ALERT_TIME, _MAX_FRAME_GAP, TRIGGER_MEASURED, TRIGGER_PREDICTED, TRIGGER_ENCROACHING, \
-  TRIGGER_LANE_ENDING, TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW, _RADAR_PASS_DELTA
+  TRIGGER_LANE_ENDING, TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW, TRIGGER_RADAR_FOLLOW, _RADAR_PASS_DELTA, _RADAR_FOLLOW_TIME
 from openpilot.common.test import OpenpilotTestCase
 
 MergeState = custom.LongitudinalPlanSP.SmartCruiseControl.MergeState
@@ -742,3 +742,92 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
       self.run_radar(1., [dict(q, dist=q['dist'] - 16. * second) for q in queue if q['dist'] - 16. * second > 5.])
       if second >= 1:
         assert self.scc.is_active, second
+
+  # ---------- follow-through: one merge, one slowdown ----------
+
+  def run_phases(self, phases, dist=38., right=4.3, v_obj=None, v_ego=None, slot=5):
+    """phases: (seconds, sideways speed toward us in m/s). Returns the state after every frame."""
+    v_ego = 56 * CV.MPH_TO_MS if v_ego is None else v_ego
+    v_obj = 50 * CV.MPH_TO_MS if v_obj is None else v_obj
+    cs = make_car_state(False, v_ego)
+    states, triggers, targets = [], [], []
+    for seconds, lat_speed in phases:
+      for _ in range(int(seconds / DT_MDL)):
+        sm: Any = {'modelV2': make_model([]), 'carState': cs, 'carStateSP': make_radar([(slot, dist, right, v_obj, v_ego)])}
+        self.scc.update(sm, True, False, v_ego, 0., 70 * CV.MPH_TO_MS)
+        self.check_output(70 * CV.MPH_TO_MS)
+        states.append(self.scc.state)
+        triggers.append(self.scc.candidate.trigger if self.scc.candidate is not None else 0)
+        targets.append(self.scc.output_v_target)
+        dist = max(5., dist + (v_obj - v_ego) * DT_MDL)
+        right -= lat_speed * DT_MDL
+    return states, triggers, targets
+
+  @staticmethod
+  def count_events(states):
+    active = [s in (MergeState.slowing, MergeState.holding) for s in states]
+    return sum(1 for a, b in zip([False] + active, active, strict=False) if b and not a)
+
+  def test_recorded_hesitant_merge_is_one_slowdown(self):
+    # Recorded Nov 24: the car moved over, paused next to our line for 3 s, then came in.
+    # The old code let go during the pause, sped up, then slowed again.
+    states, triggers, targets = self.run_phases([(2., 0.), (2., 0.6), (3., 0.), (2., 1.), (4., 0.)])
+    assert self.count_events(states) == 1
+    assert TRIGGER_RADAR_CONVERGING in triggers and TRIGGER_RADAR_FOLLOW in triggers
+    # it never let go while the car was still beside us and coming (the pause is 4 s to 7 s)
+    pause = states[int(4.5 / DT_MDL):int(7. / DT_MDL)]
+    assert all(s == MergeState.slowing for s in pause)
+
+  def test_target_is_close_to_the_merging_cars_speed(self):
+    # 50 mph car, 1.5 s ahead of us: aim a few mph under it, not 9 under as before.
+    states, triggers, targets = self.run_phases([(2., 0.), (2., 0.6)])
+    low = min(t for t in targets if t != V_CRUISE_UNSET)
+    assert 43 * CV.MPH_TO_MS < low < 49 * CV.MPH_TO_MS
+
+  def test_follow_lets_go_of_a_car_that_stays_beside_us(self):
+    # It moved toward us once, then just drives along in its lane, matching our speed. Do not hold the speed down for ever.
+    v = 56 * CV.MPH_TO_MS
+    states, triggers, targets = self.run_phases([(2., 0.), (1.5, 0.6), (_RADAR_FOLLOW_TIME + _HOLD_TIME + 4., 0.)], v_obj=v, v_ego=v)
+    assert self.count_events(states) == 1
+    assert states[-1] == MergeState.enabled
+
+  def test_follow_lets_go_when_the_car_backs_out(self):
+    states, triggers, targets = self.run_phases([(2., 0.), (1.5, 0.6), (1., 0.), (2., -0.8), (_HOLD_TIME + 1., 0.)])
+    assert self.count_events(states) == 1
+    assert states[-1] == MergeState.enabled
+    # following stopped soon after it started moving away
+    back_out = int(4.5 / DT_MDL)
+    assert TRIGGER_RADAR_FOLLOW not in triggers[back_out + int(1.5 / DT_MDL):]
+
+  def test_follow_never_starts_an_event(self):
+    # A car driving beside us with no sideways move must never be "followed".
+    states, triggers, targets = self.run_phases([(15., 0.)], right=3.4)
+    assert self.count_events(states) == 0 and TRIGGER_RADAR_FOLLOW not in triggers
+
+  def test_follow_does_not_stick_to_a_reused_radar_slot(self):
+    # The merging car leaves the radar and the slot is reused by another car far away in the same lane.
+    v_ego, v_obj = 56 * CV.MPH_TO_MS, 50 * CV.MPH_TO_MS
+    cs = make_car_state(False, v_ego)
+    triggers = []
+    right = 4.3
+    for i in range(int(8. / DT_MDL)):
+      t = i * DT_MDL
+      if 2. <= t < 4.5:
+        right -= 0.6 * DT_MDL
+      point = (5, 38., right, v_obj, v_ego) if t < 4.5 else (5, 70., 3.6, v_obj, v_ego)
+      self.scc.update({'modelV2': make_model([]), 'carState': cs, 'carStateSP': make_radar([point])}, True, False, v_ego, 0., 70 * CV.MPH_TO_MS)
+      self.check_output(70 * CV.MPH_TO_MS)
+      triggers.append(self.scc.candidate.trigger if self.scc.candidate is not None else 0)
+    assert TRIGGER_RADAR_CONVERGING in triggers
+    assert TRIGGER_RADAR_FOLLOW not in triggers[int(4.6 / DT_MDL):]
+
+  def test_target_eases_to_the_cars_speed_once_it_is_in(self):
+    # While it moves in we aim under its speed to open a gap. Once it is in our lane we aim at its speed, not below.
+    v_obj = 50 * CV.MPH_TO_MS
+    states, triggers, targets = self.run_phases([(2., 0.), (5., 0.7), (2., 0.)], v_obj=v_obj)
+    assert self.count_events(states) == 1
+    slowing = [t for s, t in zip(states, targets, strict=True) if s == MergeState.slowing]
+    holding = [t for s, t in zip(states, targets, strict=True) if s == MergeState.holding]
+    assert slowing and holding
+    assert min(slowing) < v_obj - 1.
+    np.testing.assert_allclose(holding, v_obj - 0.5, atol=0.3)

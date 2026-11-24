@@ -258,7 +258,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
       leadClosingSpeed @9 :Float32; # m/s, sideways speed toward our path.
       leadSpeed @10 :Float32; # m/s, speed of the merging vehicle.
       fault @11 :Bool; # The controller hit an unexpected error and switched itself off until restart.
-      trigger @12 :UInt8; # Why the current candidate counts: 1 sideways motion, 2 model prediction, 3 slow and close to our line, 4 its lane ends, 5 radar: moving into our lane, 6 radar: slow traffic beside us.
+      trigger @12 :UInt8; # Why the current candidate counts: 1 sideways motion, 2 model prediction, 3 slow and close to our line, 4 its lane ends, 5 radar: moving into our lane, 6 radar: slow traffic beside us, 7 radar: still following the vehicle that moved in.
       rightLaneEnding @13 :Bool; # The lane on our right looks like it runs out ahead.
       leftLaneEnding @14 :Bool;
       # Raw view of the model's three lead slots, before any threshold. For studying a drive afterwards.

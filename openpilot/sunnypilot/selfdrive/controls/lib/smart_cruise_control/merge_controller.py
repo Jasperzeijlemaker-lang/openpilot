@@ -64,7 +64,7 @@ MIN_V_TARGET = 15.6  # m/s (~35 mph). Never ask for less than this, whatever the
 
 # --- Which model leads count as "a vehicle merging into our lane" ---
 _LEAD_PROB_TH = 0.3  # model confidence that this vehicle is or will become our lead
-_IN_PATH_OFFSET = 0.9  # m. Closer to our path center than this: already in our lane, normal cruise handles it
+_IN_PATH_OFFSET = 1.2  # m. Closer to our path center than this: already in our lane, normal cruise handles it
 _MAX_OFFSET = 4.6  # m. Farther than this: more than one lane away, ignore
 _MIN_DIST = 2.  # m
 _MAX_TIME_GAP = 5.  # s. Ignore vehicles farther ahead than this many seconds of travel
@@ -93,7 +93,7 @@ _LANE_END_EDGE_STD = 1.  # m. Model uncertainty of the road edge on that side mu
 _LANE_END_TIME = 0.5  # s. The lane must look like it ends for this long
 
 TRIGGER_NONE, TRIGGER_MEASURED, TRIGGER_PREDICTED, TRIGGER_ENCROACHING, TRIGGER_LANE_ENDING = range(5)
-TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW = 5, 6
+TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW, TRIGGER_RADAR_FOLLOW = 5, 6, 7
 
 # --- The car's own radar (when it reports its object list, see sunnypilot/selfdrive/car/merge_radar.py) ---
 # Unlike the camera model, the radar reports vehicles in the lanes beside us. Two things are acted on:
@@ -116,6 +116,11 @@ _RADAR_PASS_DELTA = 15. * CV.MPH_TO_MS  # Defensive mode: never pass vehicles be
 _RADAR_SLOW_TTC = 10.  # s. Defensive mode starts when we would reach the slow vehicle within this time
 _RADAR_SLOW_MIN_DELTA = 2.  # m/s over the pass limit before defensive mode reacts at all
 _RADAR_TRACK_JUMP_DIST = 4.  # m between frames: the radar reused the slot for another object
+# Follow-through: once a vehicle made us slow down, keep the lower speed until it is in our lane or clearly not coming.
+_RADAR_FOLLOW_TIME = 8.  # s after the last real trigger. A vehicle that just drives next to us is let go after this
+_RADAR_FOLLOW_MAX_OFFSET = 5.  # m
+_RADAR_FOLLOW_MAX_FASTER = 2.  # m/s. It is pulling away; no room needed
+_RADAR_FOLLOW_MAX_AWAY = 0.3  # m/s sideways away from our path: it changed its mind
 _DEBUG_SLOTS = 3
 
 _CLOSING_FILTER_TAU = 0.4  # s. Low-pass on the measured sideways speed
@@ -142,8 +147,8 @@ _FAULT_ALERT_TIME = 5.  # s. How long the fault alert is requested
 
 # --- How much to slow ---
 _SPEED_MARGIN = 0.5  # m/s. Aim this far below the merging vehicle's speed
-_GAP_EXTRA_V = [5., 2.5, 0.]  # m/s. Extra slowdown to open a gap while the vehicle is close
-_GAP_EXTRA_BP = [1., 2., 3.5]  # s. Time gap breakpoints for the above
+_GAP_EXTRA_V = [3., 1.5, 0.]  # m/s. Extra slowdown to open a gap while the vehicle is close
+_GAP_EXTRA_BP = [0.8, 1.5, 2.5]  # s. Time gap breakpoints for the above
 _DEFAULT_MAX_DROP_MPH = 30
 _MAX_DROP_LIMITS_MPH = (5, 40)
 
@@ -157,7 +162,8 @@ def _finite(*values: float) -> bool:
 
 
 class MergeCandidate:
-  def __init__(self, dist: float, offset: float, closing_speed: float, v_lead: float, trigger: int = TRIGGER_NONE):
+  def __init__(self, dist: float, offset: float, closing_speed: float, v_lead: float, trigger: int = TRIGGER_NONE, slot: int = -1):
+    self.slot = slot  # radar slot of the vehicle, -1 for camera candidates
     self.dist = dist
     self.offset = offset
     self.closing_speed = closing_speed
@@ -279,6 +285,11 @@ class SmartCruiseControlMerge:
     self.lane_ending = {1.: False, -1.: False}  # +1 right, -1 left
     self.radar_tracks: dict[int, RadarTrack] = {}
     self.radar_objects = 0
+    self.follow_slot = -1
+    self.follow_side = 1.
+    self.follow_frames = 0
+    self.event_v_lead = 0.
+    self.event_make_room = False
     self.lane_ending_frames = {1.: 0, -1.: 0}
 
     self.last_model_frame_id: int | None = None
@@ -323,6 +334,8 @@ class SmartCruiseControlMerge:
     self.candidate_frames = 0
     self.radar_tracks = {}
     self.radar_objects = 0
+    self.follow_slot = -1
+    self.follow_frames = 0
     for side in self.lane_ending:
       self.lane_ending[side] = False
       self.lane_ending_frames[side] = 0
@@ -493,15 +506,32 @@ class SmartCruiseControlMerge:
                     _RADAR_CONVERGE_SPEED[0] < track.closing_speed < _RADAR_CONVERGE_SPEED[1] and
                     track.moved_closer > _RADAR_CONVERGE_MOVE)
       slow = closing > _RADAR_PASS_DELTA + _RADAR_SLOW_MIN_DELTA and dist / closing < _RADAR_SLOW_TTC
+      # The vehicle we are already slowing for: stay with it while it is still next to us and not backing out.
+      follow = (not converging and slot == self.follow_slot and self.follow_frames > 0 and self.state in ACTIVE_STATES and
+                offset * self.follow_side > 0. and abs(offset) < _RADAR_FOLLOW_MAX_OFFSET and dist < _RADAR_CONVERGE_MAX_DIST and
+                v_obj < self.v_ego + _RADAR_FOLLOW_MAX_FASTER and track.closing_speed > -_RADAR_FOLLOW_MAX_AWAY)
 
-      if converging or slow:
-        candidate = MergeCandidate(dist, offset, track.closing_speed, v_obj, TRIGGER_RADAR_CONVERGING if converging else TRIGGER_RADAR_SLOW)
+      if converging or slow or follow:
+        trigger = TRIGGER_RADAR_CONVERGING if converging else (TRIGGER_RADAR_FOLLOW if follow else TRIGGER_RADAR_SLOW)
+        candidate = MergeCandidate(dist, offset, track.closing_speed, v_obj, trigger, slot)
         wanted = candidate.wanted_speed(self.v_ego)
         if wanted < best_wanted:
           best, best_wanted = candidate, wanted
 
     self.radar_tracks = {slot: track for slot, track in self.radar_tracks.items() if track.updated}
     self.radar_objects = min(beside, 255)
+
+    # Remember which vehicle is moving in. Only a real sideways move starts or renews the follow-through.
+    self.follow_frames = max(0, self.follow_frames - 1)
+    if best is not None and best.trigger == TRIGGER_RADAR_CONVERGING:
+      self.follow_slot = best.slot
+      self.follow_side = 1. if best.offset > 0. else -1.
+      self.follow_frames = _FRAMES(_RADAR_FOLLOW_TIME)
+    track = self.radar_tracks.get(self.follow_slot)
+    if self.follow_frames == 0 or track is None or track.frames < _FRAMES(_RADAR_CONFIRM_TIME):
+      # Time is up, the radar lost it, or the slot now holds a different object.
+      self.follow_slot = -1
+      self.follow_frames = 0
     return best
 
   def _update_calculations(self, sm: messaging.SubMaster) -> None:
@@ -562,6 +592,7 @@ class SmartCruiseControlMerge:
     self.state = MergeState.enabled
     self.event_frames = 0
     self.hold_frames = 0
+    self.event_make_room = False
     self.v_target = V_CRUISE_UNSET
     if was_active:
       # Only an event that had to be cut off needs the road to look clear again before the next one.
@@ -608,6 +639,10 @@ class SmartCruiseControlMerge:
             # Vehicle is gone, or it finished merging and is now a normal lead.
             self.state = MergeState.holding
             self.hold_frames = _FRAMES(_HOLD_TIME)
+            # The gap is made. Stop aiming below its speed, or we fall back and then have to speed up again.
+            ease = self.event_v_lead - _SPEED_MARGIN
+            if self.event_make_room and _finite(ease, self.v_target) and self.v_target < ease:
+              self.v_target = min(ease, self.v_cruise_setpoint) if _finite(self.v_cruise_setpoint) else self.v_target
 
         # HOLDING
         elif self.state == MergeState.holding:
@@ -644,6 +679,8 @@ class SmartCruiseControlMerge:
 
     if self.state == MergeState.slowing and self.candidate is not None:
       wanted = self.candidate.wanted_speed(self.v_ego)
+      self.event_v_lead = self.candidate.v_lead
+      self.event_make_room = self.candidate.trigger != TRIGGER_RADAR_SLOW
       # Lowest speed we may ask for: the configured drop below where we started, and never under the absolute floor.
       floor = max(self.v_ref - self.max_drop, MIN_V_TARGET)
       ceiling = self.v_cruise_setpoint
