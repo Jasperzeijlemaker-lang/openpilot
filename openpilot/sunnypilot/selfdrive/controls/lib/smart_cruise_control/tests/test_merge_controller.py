@@ -21,7 +21,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.merge_controller import SmartCruiseControlMerge, \
   MIN_V_HIGHWAY, MIN_V_TARGET, _HOLD_TIME, _LOST_TIME, _MAX_EVENT_TIME, _COOLDOWN_TIME, _REARM_TIME, \
   _TIMEOUT_LOCKOUT_TIME, _FAULT_ALERT_TIME, _MAX_FRAME_GAP, TRIGGER_MEASURED, TRIGGER_PREDICTED, TRIGGER_ENCROACHING, \
-  TRIGGER_LANE_ENDING, TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW, TRIGGER_RADAR_FOLLOW, _RADAR_PASS_DELTA, _RADAR_FOLLOW_TIME
+  TRIGGER_LANE_ENDING, TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW, TRIGGER_RADAR_FOLLOW, TRIGGER_RADAR_EARLY, _RADAR_PASS_DELTA, _RADAR_FOLLOW_TIME
 from openpilot.common.test import OpenpilotTestCase
 
 MergeState = custom.LongitudinalPlanSP.SmartCruiseControl.MergeState
@@ -831,3 +831,66 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     assert slowing and holding
     assert min(slowing) < v_obj - 1.
     np.testing.assert_allclose(holding, v_obj - 0.5, atol=0.3)
+
+  # ---------- early: a vehicle coming across fast from further out ----------
+
+  def run_tracking(self, phases, right, dist=49., v_obj=None, v_ego=None):
+    """Like run_phases, but also returns the vehicle's offset at every frame."""
+    v_ego = 58 * CV.MPH_TO_MS if v_ego is None else v_ego
+    v_obj = 47 * CV.MPH_TO_MS if v_obj is None else v_obj
+    cs = make_car_state(False, v_ego)
+    out = []
+    for seconds, lat_speed in phases:
+      for _ in range(int(seconds / DT_MDL)):
+        sm: Any = {'modelV2': make_model([]), 'carState': cs, 'carStateSP': make_radar([(5, dist, right, v_obj, v_ego)])}
+        self.scc.update(sm, True, False, v_ego, 0., 70 * CV.MPH_TO_MS)
+        self.check_output(70 * CV.MPH_TO_MS)
+        out.append((self.scc.state, self.scc.candidate.trigger if self.scc.candidate is not None else 0, self.scc.output_v_target, right))
+        dist = max(5., dist + (v_obj - v_ego) * DT_MDL)
+        right -= lat_speed * DT_MDL
+    return out, v_obj
+
+  def test_recorded_fast_merge_is_caught_early(self):
+    # Recorded Nov 24: first seen 8.6 m to the right, coming across at 1.6 m/s. The old code waited until it was 3.8 m away.
+    out, v_obj = self.run_tracking([(3.5, 1.6)], right=8.6)
+    first = next(o for o in out if o[0] == MergeState.slowing)
+    assert first[1] == TRIGGER_RADAR_EARLY
+    assert first[3] > 5.5  # still more than a lane and a half away when we start
+    # gentle at first: not below its speed while it is still far out
+    early = [o[2] for o in out if o[1] == TRIGGER_RADAR_EARLY and o[2] != V_CRUISE_UNSET]
+    assert early and min(early) >= v_obj
+    # then the normal response takes over, in the same event
+    assert any(o[1] == TRIGGER_RADAR_CONVERGING for o in out)
+    states = [o[0] for o in out]
+    assert self.count_events(states) == 1
+
+  def test_ordinary_lane_change_two_lanes_over_is_not_early(self):
+    # A car going from the third lane to the second at a normal pace. It is not coming for our lane.
+    out, _ = self.run_tracking([(1., 0.), (3.6, 1.0), (3., 0.)], right=7.2)
+    assert all(o[1] != TRIGGER_RADAR_EARLY for o in out)
+
+  def test_slow_drift_far_out_is_not_early(self):
+    out, _ = self.run_tracking([(8., 0.3)], right=8.4)
+    assert all(o[1] != TRIGGER_RADAR_EARLY for o in out)
+
+  def test_fast_mover_that_is_faster_than_us_is_not_early(self):
+    v = 58 * CV.MPH_TO_MS
+    out, _ = self.run_tracking([(3., 1.6)], right=8.6, v_obj=v + 3., v_ego=v)
+    assert all(o[0] not in (MergeState.slowing, MergeState.holding) for o in out)
+
+  def test_early_only_event_lets_go(self):
+    # It came across fast but stopped in the lane next to ours. A gentle slowdown, then back to normal.
+    out, _ = self.run_tracking([(2., 1.6), (_HOLD_TIME + 3., 0.)], right=8.6)
+    assert any(o[1] == TRIGGER_RADAR_EARLY for o in out)
+    assert out[-1][0] == MergeState.enabled
+
+  def test_brief_fast_move_far_out_is_not_early(self):
+    # A quick sideways move that would still need more than 4 s to reach our lane.
+    out, _ = self.run_tracking([(1.1, 1.4), (4., 0.)], right=8.45)
+    assert all(o[1] != TRIGGER_RADAR_EARLY for o in out)
+
+  def test_far_away_fast_mover_is_not_early(self):
+    # Beyond 60 m the radar's sideways reading jumps around too much to trust a one-second move.
+    v = 58 * CV.MPH_TO_MS
+    out, _ = self.run_tracking([(2.5, 1.6)], right=8.6, dist=85., v_obj=v, v_ego=v)
+    assert all(o[1] != TRIGGER_RADAR_EARLY for o in out)

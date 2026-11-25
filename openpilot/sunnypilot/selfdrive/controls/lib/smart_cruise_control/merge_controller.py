@@ -93,7 +93,7 @@ _LANE_END_EDGE_STD = 1.  # m. Model uncertainty of the road edge on that side mu
 _LANE_END_TIME = 0.5  # s. The lane must look like it ends for this long
 
 TRIGGER_NONE, TRIGGER_MEASURED, TRIGGER_PREDICTED, TRIGGER_ENCROACHING, TRIGGER_LANE_ENDING = range(5)
-TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW, TRIGGER_RADAR_FOLLOW = 5, 6, 7
+TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW, TRIGGER_RADAR_FOLLOW, TRIGGER_RADAR_EARLY = 5, 6, 7, 8
 
 # --- The car's own radar (when it reports its object list, see sunnypilot/selfdrive/car/merge_radar.py) ---
 # Unlike the camera model, the radar reports vehicles in the lanes beside us. Two things are acted on:
@@ -116,6 +116,13 @@ _RADAR_PASS_DELTA = 15. * CV.MPH_TO_MS  # Defensive mode: never pass vehicles be
 _RADAR_SLOW_TTC = 10.  # s. Defensive mode starts when we would reach the slow vehicle within this time
 _RADAR_SLOW_MIN_DELTA = 2.  # m/s over the pass limit before defensive mode reacts at all
 _RADAR_TRACK_JUMP_DIST = 4.  # m between frames: the radar reused the slot for another object
+# Early: a vehicle further out that is coming across quickly and would reach our lane within a few seconds.
+# The evidence is weaker than for a vehicle right next to us, so the response is gentler.
+_RADAR_EARLY_WINDOW = 1.  # s
+_RADAR_EARLY_MOVE = 1.2  # m toward our path within that window. An ordinary lane change is slower than this
+_RADAR_EARLY_TIME_TO_LANE = 4.  # s until it reaches our lane at its current sideways speed
+_RADAR_EARLY_DELTA = 5. * CV.MPH_TO_MS  # we may still be this much faster than it
+_RADAR_EARLY_MAX_DIST = 60.  # m. Further out the radar's sideways reading is too jumpy to act on a short move
 # Follow-through: once a vehicle made us slow down, keep the lower speed until it is in our lane or clearly not coming.
 _RADAR_FOLLOW_TIME = 8.  # s after the last real trigger. A vehicle that just drives next to us is let go after this
 _RADAR_FOLLOW_MAX_OFFSET = 5.  # m
@@ -174,6 +181,9 @@ class MergeCandidate:
     if self.trigger == TRIGGER_RADAR_SLOW:
       # Defensive: keep passing, but not much faster than the vehicles beside us.
       return self.v_lead + _RADAR_PASS_DELTA
+    if self.trigger == TRIGGER_RADAR_EARLY:
+      # Proactive: take most of the speed difference out before it arrives.
+      return self.v_lead + _RADAR_EARLY_DELTA
     # Make room: a little under its speed, lower still while it is close so the gap grows.
     time_gap = self.dist / max(v_ego, 0.1)
     return self.v_lead - _SPEED_MARGIN - float(np.interp(time_gap, _GAP_EXTRA_BP, _GAP_EXTRA_V))
@@ -244,6 +254,16 @@ class RadarTrack:
       return 0.
     values = list(self.history)
     n = _RADAR_CONVERGE_AVG
+    return sum(values[:n]) / n - sum(values[-n:]) / n
+
+  @property
+  def moved_closer_early(self) -> float:
+    """The same over the shorter early window. 0 until we have watched it that long."""
+    count = _FRAMES(_RADAR_EARLY_WINDOW) + 1
+    if len(self.history) < count:
+      return 0.
+    values = list(self.history)[-count:]
+    n = min(_RADAR_CONVERGE_AVG, 3)
     return sum(values[:n]) / n - sum(values[-n:]) / n
 
 
@@ -506,13 +526,17 @@ class SmartCruiseControlMerge:
                     _RADAR_CONVERGE_SPEED[0] < track.closing_speed < _RADAR_CONVERGE_SPEED[1] and
                     track.moved_closer > _RADAR_CONVERGE_MOVE)
       slow = closing > _RADAR_PASS_DELTA + _RADAR_SLOW_MIN_DELTA and dist / closing < _RADAR_SLOW_TTC
+      early = (not converging and dist < _RADAR_EARLY_MAX_DIST and v_obj < self.v_ego + _RADAR_CONVERGE_MAX_FASTER and
+               track.moved_closer_early > _RADAR_EARLY_MOVE and track.closing_speed > _RADAR_CONVERGE_SPEED[0] and
+               (abs(offset) - _RADAR_IN_PATH_OFFSET) / track.closing_speed < _RADAR_EARLY_TIME_TO_LANE)
       # The vehicle we are already slowing for: stay with it while it is still next to us and not backing out.
       follow = (not converging and slot == self.follow_slot and self.follow_frames > 0 and self.state in ACTIVE_STATES and
                 offset * self.follow_side > 0. and abs(offset) < _RADAR_FOLLOW_MAX_OFFSET and dist < _RADAR_CONVERGE_MAX_DIST and
                 v_obj < self.v_ego + _RADAR_FOLLOW_MAX_FASTER and track.closing_speed > -_RADAR_FOLLOW_MAX_AWAY)
 
-      if converging or slow or follow:
-        trigger = TRIGGER_RADAR_CONVERGING if converging else (TRIGGER_RADAR_FOLLOW if follow else TRIGGER_RADAR_SLOW)
+      if converging or slow or follow or early:
+        trigger = (TRIGGER_RADAR_CONVERGING if converging else TRIGGER_RADAR_FOLLOW if follow else
+                   TRIGGER_RADAR_EARLY if early else TRIGGER_RADAR_SLOW)
         candidate = MergeCandidate(dist, offset, track.closing_speed, v_obj, trigger, slot)
         wanted = candidate.wanted_speed(self.v_ego)
         if wanted < best_wanted:
@@ -680,7 +704,7 @@ class SmartCruiseControlMerge:
     if self.state == MergeState.slowing and self.candidate is not None:
       wanted = self.candidate.wanted_speed(self.v_ego)
       self.event_v_lead = self.candidate.v_lead
-      self.event_make_room = self.candidate.trigger != TRIGGER_RADAR_SLOW
+      self.event_make_room = self.candidate.trigger not in (TRIGGER_RADAR_SLOW, TRIGGER_RADAR_EARLY)
       # Lowest speed we may ask for: the configured drop below where we started, and never under the absolute floor.
       floor = max(self.v_ref - self.max_drop, MIN_V_TARGET)
       ceiling = self.v_cruise_setpoint
