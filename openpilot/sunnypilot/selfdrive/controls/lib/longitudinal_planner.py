@@ -14,6 +14,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.accel_boost import AccelBoostSP
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_cruise_control import SmartCruiseControl
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.merge_controller import MergeState
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.curve_speed import button_cruise_curve_speed
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
@@ -38,6 +39,14 @@ class LongitudinalPlannerSP:
 
     self.output_v_target = 0.
     self.output_a_target = 0.
+
+  def _vision_v_target(self) -> float:
+    vision = self.scc.vision
+    if self.openpilot_longitudinal:
+      return vision.output_v_target
+    # Button-driven cruise: the number becomes the set speed as it is, so hand out the real curve speed.
+    # v_target only exists once the vision controller has run with the cruise engaged
+    return button_cruise_curve_speed(vision.is_active, vision.output_v_target, getattr(vision, 'v_target', 0.))
 
   def update_targets(self, sm: messaging.SubMaster, v_ego: float, a_ego: float, v_cruise: float) -> tuple[float, float]:
     CS = sm['carState']
@@ -68,7 +77,7 @@ class LongitudinalPlannerSP:
 
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),
-      LongitudinalPlanSource.sccVision: (self.scc.vision.output_v_target, self.scc.vision.output_a_target),
+      LongitudinalPlanSource.sccVision: (self._vision_v_target(), self.scc.vision.output_a_target),
       LongitudinalPlanSource.sccMap: (self.scc.map.output_v_target, self.scc.map.output_a_target),
       LongitudinalPlanSource.sccMerge: (self.scc.merge.output_v_target, self.scc.merge.output_a_target),
       LongitudinalPlanSource.speedLimitAssist: (self.sla.output_v_target, self.sla.output_a_target),

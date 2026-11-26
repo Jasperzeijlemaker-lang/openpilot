@@ -112,7 +112,13 @@ _RADAR_CONVERGE_MOVE = 0.75  # m
 _RADAR_CONVERGE_AVG = 5  # readings averaged at each end of the window, so one jittery reading cannot fake a move
 _RADAR_CONVERGE_MAX_FASTER = 0.5  # m/s. A vehicle faster than us needs no room
 _RADAR_CONFIRM_TIME = 0.4  # s. A radar object must be tracked this long before it counts
-_RADAR_PASS_DELTA = 15. * CV.MPH_TO_MS  # Defensive mode: never pass vehicles beside us more than this much faster
+_RADAR_PASS_DELTA = 20. * CV.MPH_TO_MS  # Defensive mode: never pass vehicles beside us more than this much faster
+# A slow line that is leaving the highway is no reason to slow down. It shows as a line of slow vehicles whose
+# sideways distance from our path grows the further ahead they are, or as one slow vehicle moving steadily away.
+_EXIT_PEEL_MIN_SLOWER = 3.  # m/s slower than us to count as part of a slow line
+_EXIT_PEEL_MIN_SPAN = 15.  # m between the nearest and the farthest vehicle of the line
+_EXIT_PEEL_SLOPE = 0.035  # m sideways per m ahead (1.75 m over 50 m)
+_EXIT_PEEL_AWAY_SPEED = 0.3  # m/s sideways away from us, for a single vehicle
 _RADAR_SLOW_TTC = 10.  # s. Defensive mode starts when we would reach the slow vehicle within this time
 _RADAR_SLOW_MIN_DELTA = 2.  # m/s over the pass limit before defensive mode reacts at all
 _RADAR_TRACK_JUMP_DIST = 4.  # m between frames: the radar reused the slot for another object
@@ -495,6 +501,18 @@ class SmartCruiseControlMerge:
 
     return best
 
+  @staticmethod
+  def _slow_line_is_leaving(candidate: MergeCandidate, line: list[tuple[float, float]]) -> bool:
+    """True when the slow traffic beside us is heading off the highway (an exit), not staying next to our lane."""
+    if candidate.closing_speed < -_EXIT_PEEL_AWAY_SPEED:
+      return True  # this vehicle itself is moving steadily away from us
+    if len(line) >= 2:
+      near, far = min(line), max(line)
+      span = far[0] - near[0]
+      if span >= _EXIT_PEEL_MIN_SPAN and (far[1] - near[1]) / span > _EXIT_PEEL_SLOPE:
+        return True  # the further ahead, the further off to the side: the line is peeling away
+    return False
+
   def _find_radar_candidate(self, sm: messaging.SubMaster, md, dt: float) -> MergeCandidate | None:
     """Vehicles beside our lane, from the car's own radar. Returns the one that asks for the lowest speed."""
     try:
@@ -516,6 +534,8 @@ class SmartCruiseControlMerge:
     max_dist = min(max(self.v_ego * _MAX_TIME_GAP, _MIN_MAX_DIST), _RADAR_MAX_DIST)
     best: MergeCandidate | None = None
     best_wanted = float('inf')
+    slow_candidates: list[MergeCandidate] = []
+    slow_line: dict[float, list[tuple[float, float]]] = {1.: [], -1.: []}  # side -> (distance, sideways distance)
     beside = 0
 
     for point in points:
@@ -558,13 +578,26 @@ class SmartCruiseControlMerge:
           track.closing_speed > _RADAR_CONVERGE_SPEED[0]):
         self.ready_frames = _FRAMES(_READY_HOLD_TIME)
 
+      if closing > _EXIT_PEEL_MIN_SLOWER:
+        slow_line[1. if offset > 0. else -1.].append((dist, abs(offset)))
+
       if converging or slow or follow or early:
         trigger = (TRIGGER_RADAR_CONVERGING if converging else TRIGGER_RADAR_FOLLOW if follow else
                    TRIGGER_RADAR_EARLY if early else TRIGGER_RADAR_SLOW)
         candidate = MergeCandidate(dist, offset, track.closing_speed, v_obj, trigger, slot)
+        if trigger == TRIGGER_RADAR_SLOW:
+          slow_candidates.append(candidate)  # decided below, once the whole line has been seen
+          continue
         wanted = candidate.wanted_speed(self.v_ego)
         if wanted < best_wanted:
           best, best_wanted = candidate, wanted
+
+    for candidate in slow_candidates:
+      if self._slow_line_is_leaving(candidate, slow_line[1. if candidate.offset > 0. else -1.]):
+        continue
+      wanted = candidate.wanted_speed(self.v_ego)
+      if wanted < best_wanted:
+        best, best_wanted = candidate, wanted
 
     self.radar_tracks = {slot: track for slot, track in self.radar_tracks.items() if track.updated}
     self.radar_objects = min(beside, 255)

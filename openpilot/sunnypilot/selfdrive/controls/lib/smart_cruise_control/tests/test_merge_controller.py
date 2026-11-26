@@ -954,3 +954,56 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     # Same sideways move, but 60 m ahead and only 6 mph slower: the cruise can deal with that.
     flags = self.brake_flags(phases=[(1.5, 0.), (3., 1.0)], right=4.2, dist=60., v_obj=56 * CV.MPH_TO_MS, v_ego=62 * CV.MPH_TO_MS)
     assert not any(flags)
+
+  # ---------- slow traffic beside us: exit lines are left alone ----------
+
+  def slow_line_result(self, line, seconds=3.):
+    """line: (distance, metres to the right, mph). Returns (was there a slowdown, lowest speed asked for)."""
+    v_ego = 68 * CV.MPH_TO_MS
+    cs = make_car_state(False, v_ego)
+    line = [list(x) for x in line]
+    slowed, low = False, V_CRUISE_UNSET
+    for _ in range(int(seconds / DT_MDL)):
+      pts = [(i + 1, d, r, mph * CV.MPH_TO_MS, v_ego) for i, (d, r, mph) in enumerate(line)]
+      self.scc.update({'modelV2': make_model([]), 'carState': cs, 'carStateSP': make_radar(pts)}, True, False, v_ego, 0., 70 * CV.MPH_TO_MS)
+      self.check_output(70 * CV.MPH_TO_MS)
+      if self.scc.state == MergeState.slowing:
+        slowed = True
+        low = min(low, self.scc.output_v_target)
+      for x in line:
+        x[0] += (x[2] * CV.MPH_TO_MS - v_ego) * DT_MDL
+    return slowed, low
+
+  def test_slow_line_in_the_next_lane_still_slows_us_but_less(self):
+    # 40 mph traffic in the lane right next to ours, staying parallel. We may pass at 60, not crawl at 55.
+    slowed, low = self.slow_line_result([(70., 3.6, 40), (95., 3.6, 40), (120., 3.7, 40)])
+    assert slowed
+    np.testing.assert_allclose(low, 60 * CV.MPH_TO_MS, atol=0.3)
+
+  def test_line_25_mph_slower_no_longer_slows_us(self):
+    # Recorded Nov 25, 29:37: cars doing 47 beside us at 68. The old limit (15 mph) slowed us to 62.
+    slowed, _ = self.slow_line_result([(45., 3.3, 47), (80., 3.6, 47)])
+    assert not slowed
+
+  def test_exit_line_peeling_away_is_ignored(self):
+    # The same 40 mph line, but the further ahead the further right: it is leaving on an exit.
+    slowed, _ = self.slow_line_result([(70., 3.6, 40), (95., 5.0, 40), (120., 6.6, 40)])
+    assert not slowed
+
+  def test_on_ramp_line_coming_toward_us_is_not_mistaken_for_an_exit(self):
+    # Recorded Nov 19: the further ahead the CLOSER to our lane. That line is coming in. Keep slowing.
+    slowed, _ = self.slow_line_result([(70., 7.5, 40), (95., 6.2, 40), (120., 4.8, 40)])
+    assert slowed
+
+  def test_single_slow_car_moving_away_is_ignored(self):
+    v_ego = 68 * CV.MPH_TO_MS
+    cs = make_car_state(False, v_ego)
+    right, dist, slowed = 3.6, 80., False
+    for _ in range(int(3. / DT_MDL)):
+      self.scc.update({'modelV2': make_model([]), 'carState': cs, 'carStateSP': make_radar([(1, dist, right, 40 * CV.MPH_TO_MS, v_ego)])},
+                      True, False, v_ego, 0., 70 * CV.MPH_TO_MS)
+      self.check_output(70 * CV.MPH_TO_MS)
+      slowed = slowed or (self.scc.state == MergeState.slowing and right > 4.4)
+      right += 0.8 * DT_MDL
+      dist += (40 * CV.MPH_TO_MS - v_ego) * DT_MDL
+    assert not slowed
