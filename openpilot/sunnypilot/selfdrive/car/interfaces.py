@@ -89,11 +89,40 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
   set_speed_limit_assist_availability(CP, CP_SP, params)
 
 
+# Steering strength measured on the owner's car, used in place of a generic placeholder.
+# The number is the sideways acceleration (m/s^2) the car reaches at full steering command.
+# Ioniq 6: sunnypilot has no measured data and uses 2.5. The device's own estimator measured 3.04 on this car
+# (6,166 points, drive of 2026-11-25). With 2.5 every steering correction is about 20% too strong, and the wheel
+# swings back and forth for several seconds after a bump.
+MEASURED_LAT_ACCEL_FACTOR = {
+  "HYUNDAI_IONIQ_6": (2.5, 3.0),  # (placeholder that gets replaced, measured value)
+}
+
+
+def _apply_measured_torque_tune(CP: structs.CarParams) -> bool:
+  """Replace the placeholder steering strength with the measured one.
+  Only for the listed cars, only with torque steering, and only while the placeholder is still in place.
+  Custom Tuning and Self-Tune in the settings are applied later by the controller and still win."""
+  try:
+    entry = MEASURED_LAT_ACCEL_FACTOR.get(str(CP.carFingerprint))
+    if entry is None or CP.lateralTuning.which() != 'torque':
+      return False
+    placeholder, measured = entry
+    if not abs(float(CP.lateralTuning.torque.latAccelFactor) - placeholder) <= 1e-3:
+      return False
+    CP.lateralTuning.torque.latAccelFactor = measured
+    return True
+  except Exception:
+    cloudlog.exception("measured torque tune not applied")
+    return False
+
+
 def setup_interfaces(CI: CarInterfaceBase, params: Params | None = None) -> None:
   enforce_torque = _enforce_torque_lateral_control(CI.CP, params)
   nnlc_enabled = _initialize_neural_network_lateral_control(CI.CP, CI.CP_SP, params)
   _initialize_intelligent_cruise_button_management(CI.CP, CI.CP_SP, params)
   _initialize_torque_lateral_control(CI, CI.CP, enforce_torque, nnlc_enabled)
+  _apply_measured_torque_tune(CI.CP)
   _cleanup_unsupported_params(CI.CP, CI.CP_SP)
 
   try:
