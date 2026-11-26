@@ -101,6 +101,44 @@ class TestPassOrWait(Base):
     self.drive(1.4, dist=32., right=9.0, v_obj=V_EGO - 2., lat_speed=2.5)
     assert self.triggers & MOVING_IN and self.scc.passes == 0
 
+  # ----- a vehicle beside us -----
+
+  def test_car_beside_us_coming_off_a_ramp_into_the_next_lane_is_not_slowed_for(self):
+    # recorded 2026-11-26 afternoon 08:12: tail 11 m ahead of our nose, 6 mph slower, from 7.8 m out to 3.2 m (the next lane)
+    dist, right = 11., 7.8
+    for _ in range(40):
+      dist = self.drive(0.1, dist=dist, right=right, v_obj=V_EGO - 2.7, v_cruise=V_EGO + 4.)
+      right = max(3.2, right - 0.12)
+      assert not self.triggers and self.scc.output_v_target == V_CRUISE_UNSET and not self.scc.brake_warning
+    assert self.scc.passes > 0
+
+  def test_same_car_further_ahead_is_still_slowed_for(self):
+    dist, right = 30., 7.8
+    for _ in range(40):
+      dist = self.drive(0.1, dist=dist, right=right, v_obj=V_EGO - 2.7, v_cruise=V_EGO + 4.)
+      right = max(3.2, right - 0.12)
+    assert self.triggers & MOVING_IN
+
+  # ----- brake warning -----
+
+  def test_brake_warning_for_a_slow_car_crossing_fast_from_two_lanes_out(self):
+    # recorded 2026-11-26 afternoon 12:09: 47 mph car 43 m ahead, 8.9 m right, crossing at 1.7 m/s while we did 67 mph
+    dist, right, warned_at = 43., 8.4, None
+    for i in range(30):
+      dist = self.drive(0.1, dist=dist, right=right, v_obj=V_EGO - 9., v_cruise=V_EGO + 1.)
+      right -= 0.17
+      if self.scc.brake_warning and warned_at is None:
+        warned_at = (i + 1) * 0.1
+        assert right > 4.2                       # still outside the old 4 m limit when the warning comes
+    assert warned_at is not None
+
+  def test_no_brake_warning_for_a_car_crossing_fast_far_ahead_at_our_speed(self):
+    dist, right = 70., 8.4
+    for _ in range(30):
+      dist = self.drive(0.1, dist=dist, right=right, v_obj=V_EGO - 1., v_cruise=V_EGO + 1.)
+      right -= 0.17
+      assert not self.scc.brake_warning
+
   # ----- its lane is ending -----
 
   def test_lane_ending_and_we_cannot_get_by_in_time_lets_it_in(self):

@@ -111,6 +111,12 @@ _BLINKER_MOVE_TIME = 3.  # s. A driver who signals usually starts across about t
 _WAIT_GAP = 8.  # m we would want to be behind it
 _WAIT_MAX_DECEL = 1.5  # m/s2. More than the cruise can do
 _WAIT_WIDE_OFFSET = 5.  # m. Only for a vehicle still more than a lane away. One in the next lane always gets the slowdown
+# Alongside. A vehicle whose tail is only this far ahead of our nose, while we are not falling back, is beside us:
+# it cannot come in ahead of us, and slowing only keeps us next to it for longer.
+# (2026-11-26 afternoon, 08:12: a car came off a ramp into the NEXT lane 7 to 11 m ahead of our nose, 6 mph slower.
+# We were asked down to 48 mph and lost 4 mph for 8 s.)
+_ALONGSIDE_DIST = 12.  # m
+_ALONGSIDE_MIN_CLOSING = -0.5  # m/s. We are as fast as it, or faster
 # Fits ahead: it comes in far enough in front that matching its speed is all that is needed. No extra room is made.
 _FIT_GAP_NOW = 1.2  # s of our travel between us and it now
 _FIT_GAP_ON_ARRIVAL = 0.9  # s of our travel still left when it reaches our lane (we may be catching it meanwhile)
@@ -180,6 +186,7 @@ _READY_MIN_SLOWER = 1.  # m/s. Only for a vehicle slower than us. One at our spe
 _BRAKE_WARN_MIN_CLOSING = 2.  # m/s
 _BRAKE_WARN_HEADWAY = 0.8  # s of following distance we want to keep to the vehicle coming in
 _BRAKE_WARN_DECEL = 1.0  # m/s2 needed to keep that distance. The cruise manages about half of this
+_BRAKE_WARN_CROSSING_SPEED = 1.0  # m/s sideways toward us: counts even when it is still more than a lane away
 _BRAKE_WARN_MAX_OFFSET = 4.  # m. It must be next to our lane or entering it
 _BRAKE_WARN_HOLD_TIME = 1.5  # s
 _RADAR_EARLY_MAX_DIST = 60.  # m. Further out the radar's sideways reading is too jumpy to act on a short move
@@ -701,6 +708,8 @@ class SmartCruiseControlMerge:
                     (dist - max(closing, 0.) * arrival) / max(self.v_ego, 0.1) > _FIT_GAP_ON_ARRIVAL)
       if fits_ahead and closing < _FIT_IGNORE_CLOSING:
         can_pass = True  # comes in ahead with room and we are not catching it: nothing to do
+      if dist < _ALONGSIDE_DIST and closing > _ALONGSIDE_MIN_CLOSING:
+        can_pass = True  # it is beside us
       if can_pass and not follow and (converging or early or blinker or lane_ending):
         # We are past before it gets here: keep our speed, it comes in behind us.
         self.passes += 1
@@ -987,8 +996,12 @@ class SmartCruiseControlMerge:
   def _update_brake_warning(self) -> None:
     self.brake_warning_frames = max(0, self.brake_warning_frames - 1)
     c = self.candidate
+    # Near our lane already, or still further out but coming across fast (2026-11-26 afternoon, 12:09: a 47 mph car
+    # 36 m ahead and 7.7 m to the right, crossing at 1.7 m/s while we did 67. No warning then; the driver braked hard).
     if (self.state == MergeState.slowing and c is not None and c.trigger != TRIGGER_RADAR_SLOW and
-        _finite(c.dist, c.v_lead, c.offset, self.v_ego) and abs(c.offset) < _BRAKE_WARN_MAX_OFFSET):
+        _finite(c.dist, c.v_lead, c.offset, c.closing_speed, self.v_ego) and
+        (abs(c.offset) < _BRAKE_WARN_MAX_OFFSET or
+         (c.closing_speed > _BRAKE_WARN_CROSSING_SPEED and abs(c.offset) < _RADAR_MAX_OFFSET))):
       closing = self.v_ego - c.v_lead
       room = max(c.dist - _BRAKE_WARN_HEADWAY * self.v_ego, 2.)
       if closing > _BRAKE_WARN_MIN_CLOSING and closing ** 2 / (2. * room) > _BRAKE_WARN_DECEL:
