@@ -68,6 +68,9 @@ def navigation(started: bool, params: Params, CP: car.CarParams) -> bool:
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
+def blinker_watch(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and params.get_bool("BlinkerWatch")
+
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")
 
@@ -157,6 +160,7 @@ procs = [
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
   PythonProcess("updated", "openpilot.system.updated.updated", only_offroad, enabled=not PC),
   PythonProcess("remote_update", "openpilot.sunnypilot.system.remote_update", only_offroad, enabled=not PC),
+  PythonProcess("blinkerd", "openpilot.sunnypilot.selfdrive.blinker.blinkerd", blinker_watch, enabled=not PC),
   PythonProcess("uploader", "openpilot.system.loggerd.uploader", uploader_ready),
   PythonProcess("statsd", "openpilot.sunnypilot.system.statsd", always_run),
 

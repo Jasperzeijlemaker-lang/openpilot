@@ -1098,6 +1098,12 @@
                   ]
                 },
                 {
+                  "key": "BlinkerWatch",
+                  "widget": "toggle",
+                  "title": "Blinker Watch (watch only)",
+                  "description": "Looks at the road camera for vehicles flashing a turn signal and writes what it sees to the drive log. It does not change speed or steering yet. Takes effect on the next drive."
+                },
+                {
                   "key": "SmartCruiseControlMergeMaxDrop",
                   "widget": "option",
                   "title": "Max Speed Reduction (mph)",
