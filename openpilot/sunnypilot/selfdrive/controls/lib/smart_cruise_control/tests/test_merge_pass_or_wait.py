@@ -45,10 +45,42 @@ class TestPassOrWait(Base):
 
   # ----- a vehicle that is already moving over -----
 
-  def test_car_moving_in_far_ahead_at_our_speed_just_gets_matched(self):
-    self.drive(4., dist=60., right=3.8, v_obj=V_EGO, lat_speed=0.7)
+  def test_car_moving_in_ahead_with_room_at_our_speed_is_left_to_the_cars_own_cruise(self):
+    # recorded 2026-11-26 08:11: 41 m ahead, 1 mph slower. We dropped 4 mph for it. Now: nothing.
+    for dist, slower in ((41., 0.5), (60., 0.), (72., 0.4)):
+      self.setup_method()
+      self.drive(4., dist=dist, right=3.8, v_obj=V_EGO - slower, lat_speed=0.7, v_cruise=V_EGO + 6.)
+      assert not self.triggers and self.scc.output_v_target == V_CRUISE_UNSET and not self.scc.ready, dist
+
+  def test_car_moving_in_ahead_with_room_but_slower_gets_matched(self):
+    self.drive(3., dist=60., right=3.8, v_obj=V_EGO - 3., lat_speed=0.7)
     assert self.triggers & MOVING_IN
-    assert self.lowest >= V_EGO - 0.3            # room is already there: no slowing below its speed
+    np.testing.assert_allclose(self.lowest, V_EGO - 3., atol=0.3)   # its speed, no lower
+
+  def test_radar_ghosts_beside_the_lane_do_nothing(self):
+    # recorded 2026-11-26 16:02: a wall the radar reports as objects doing 2 to 20 mph, 6 to 16 m ahead, drifting our way
+    for v_ghost in (1., 4.5, 7., 9.):
+      self.setup_method()
+      self.drive(3., dist=14., right=8.1, v_obj=v_ghost, lat_speed=0.5, v_ego=29., v_cruise=31.3)
+      assert not self.triggers and not self.scc.ready and self.scc.output_v_target == V_CRUISE_UNSET, v_ghost
+
+  def test_getting_ready_leaves_room_to_speed_up(self):
+    # a slower car beside us drifts our way: the set speed comes down, but stays 2.5 m/s above our speed
+    dist, right, asked = 28., 8.0, []
+    for _ in range(30):
+      dist = self.drive(0.1, dist=dist, right=right, v_obj=V_EGO - 3., lat_speed=0.4, v_cruise=V_EGO + 6.)
+      right -= 0.04
+      if self.scc.ready:
+        asked.append(self.scc.output_v_target)
+    assert asked and all(abs(a - (V_EGO + 2.5)) < 1e-6 for a in asked)
+
+  def test_no_getting_ready_for_a_car_at_our_speed(self):
+    # recorded 2026-11-26 08:26: a car 16 m ahead on the right at our speed held the set speed down
+    dist, right = 16., 7.6
+    for _ in range(25):
+      dist = self.drive(0.1, dist=dist, right=right, v_obj=V_EGO, lat_speed=0.5, v_cruise=V_EGO + 6.)
+      right -= 0.05
+      assert not self.scc.ready and self.scc.output_v_target == V_CRUISE_UNSET
 
   def test_car_moving_in_close_at_our_speed_still_gets_room(self):
     self.drive(4., dist=35., right=3.8, v_obj=V_EGO, lat_speed=0.7)   # 1.1 s ahead of us: too tight to call it room

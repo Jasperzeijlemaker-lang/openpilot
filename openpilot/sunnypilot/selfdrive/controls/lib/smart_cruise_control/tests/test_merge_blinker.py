@@ -33,7 +33,7 @@ class TestMergeBlinker:
     self.triggers: set[int] = set()
 
   def drive(self, seconds, dist=40., right=3.6, v_obj=V_EGO - 6., signal=0, note_from=0., note_until=1e9, note_dist_error=0., note_slot=5,
-            raw_note=None, lat_speed=0., v_ego=V_EGO):
+            raw_note=None, lat_speed=0., v_ego=V_EGO, v_cruise=None):
     """One vehicle (radar slot 5) beside us. `signal` is what Blinker Watch reports for it between note_from and note_until."""
     cs = make_car_state(False, v_ego)
     for i in range(int(seconds / DT_MDL)):
@@ -45,9 +45,9 @@ class TestMergeBlinker:
         det = types.SimpleNamespace(slot=note_slot, side=signal, dist=dist + note_dist_error)
         self.params.put(beacon.KEY, beacon.encode([det], self.now))
       sm = {'modelV2': make_model([]), 'carState': cs, 'carStateSP': make_radar([(5, dist, right, v_obj, v_ego)])}
-      self.scc.update(sm, True, False, v_ego, 0., v_ego)
+      self.scc.update(sm, True, False, v_ego, 0., v_ego if v_cruise is None else v_cruise)
       out = self.scc.output_v_target
-      assert out == V_CRUISE_UNSET or (np.isfinite(out) and mc.MIN_V_TARGET <= out <= v_ego + 1e-6)
+      assert out == V_CRUISE_UNSET or (np.isfinite(out) and mc.MIN_V_TARGET <= out <= max(v_ego, v_cruise or 0.) + 1e-6)
       if self.scc.state == MergeState.slowing and self.scc.candidate is not None:
         self.triggers.add(self.scc.candidate.trigger)
         self.lowest = min(self.lowest, out)

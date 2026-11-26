@@ -112,8 +112,11 @@ _WAIT_GAP = 8.  # m we would want to be behind it
 _WAIT_MAX_DECEL = 1.5  # m/s2. More than the cruise can do
 _WAIT_WIDE_OFFSET = 5.  # m. Only for a vehicle still more than a lane away. One in the next lane always gets the slowdown
 # Fits ahead: it comes in far enough in front that matching its speed is all that is needed. No extra room is made.
-_FIT_GAP_NOW = 1.5  # s of our travel between us and it now
-_FIT_GAP_ON_ARRIVAL = 1.0  # s of our travel still left when it reaches our lane (we may be catching it meanwhile)
+_FIT_GAP_NOW = 1.2  # s of our travel between us and it now
+_FIT_GAP_ON_ARRIVAL = 0.9  # s of our travel still left when it reaches our lane (we may be catching it meanwhile)
+# ...and if we are hardly catching it, nothing is done at all: the car's own cruise follows it once it is in front.
+# (2026-11-26 08:11: a car came in 41 m ahead at our speed and we dropped 4 mph for it.)
+_FIT_IGNORE_CLOSING = 2.  # m/s
 _FIT_MAX_ARRIVAL_TIME = 4.  # s. Do not look further ahead than this when working out the gap on arrival
 
 # Turn signals seen by Blinker Watch (camera). A signal is a hint, not a move: it gives a head start, nothing more.
@@ -128,6 +131,14 @@ _BLINKER_DELTA = 5. * CV.MPH_TO_MS  # signalling toward our lane: come down to i
 #   converging: a vehicle beside us is moving sideways toward our path           -> make room, match its speed
 #   slow:       vehicles beside us are much slower than us (a queue, an on-ramp) -> defensive: limit how fast we pass them
 _RADAR_MIN_OBJ_SPEED = 4.  # m/s. Slower than this over the ground: a sign, a barrier, a parked car. Ignore
+# ...and slower than this share of our own speed: a wall or barrier the radar gives a made-up speed of 10 to 20 mph
+# (2026-11-26 16:02: a row of those beside the lane pulled the set speed down). Real slow traffic is well above it.
+_RADAR_MIN_OBJ_SPEED_SHARE = 0.4
+# Camera-only candidates. 2026-11-26 09:28 and 16:10: the camera reported a "vehicle" 4 m ahead doing 2 mph while we
+# did 68. That set off a slowdown and the brake warning.
+_CAMERA_MIN_DIST = 8.  # m
+_CAMERA_MIN_SPEED_SHARE = 0.2
+_RADAR_SEEN_TIME = 30.  # s. Radar objects seen this recently: the radar works
 _RADAR_MIN_DIST = 4.  # m
 _RADAR_MAX_DIST = 160.  # m
 _RADAR_IN_PATH_OFFSET = 1.3  # m. Closer to our path than this: in our lane, the stock cruise handles it
@@ -163,7 +174,8 @@ _READY_MOVE = 0.35  # m toward our path within the early window
 _READY_MAX_DIST = 80.  # m
 _READY_MAX_FASTER = 2.  # m/s
 _READY_HOLD_TIME = 2.  # s
-_READY_MARGIN = 1.  # m/s above our speed: never below it, so getting ready cannot slow us
+_READY_MARGIN = 2.5  # m/s above our speed. Leaves room to speed up and go by (2026-11-26 08:26: 1 m/s held us back)
+_READY_MIN_SLOWER = 1.  # m/s. Only for a vehicle slower than us. One at our speed or faster needs no getting ready
 # Brake warning: the cruise cannot brake. Tell the driver when the gap is closing faster than it can handle.
 _BRAKE_WARN_MIN_CLOSING = 2.  # m/s
 _BRAKE_WARN_HEADWAY = 0.8  # s of following distance we want to keep to the vehicle coming in
@@ -348,6 +360,7 @@ class SmartCruiseControlMerge:
     self.both_sides = False
     self.use_blinkers = False
     self.blinkers: dict[int, tuple[int, float]] = {}  # radar slot -> (signal side: -1 left, +1 right; distance)
+    self.radar_seen_frames = 0
     self.passes = 0  # times we chose to keep our speed and pass (for the log and for replays)
     self.last_pass: tuple | None = None
     self.mem_params = None
@@ -613,11 +626,13 @@ class SmartCruiseControlMerge:
     slow_line: dict[float, list[tuple[float, float]]] = {1.: [], -1.: []}  # side -> (distance, sideways distance)
     beside = 0
 
+    if len(points) > 0:
+      self.radar_seen_frames = _FRAMES(_RADAR_SEEN_TIME)
     for point in points:
       slot, dist, y_left, v_rel = int(point.slot), float(point.dRel), float(point.yRel), float(point.vRel)
       v_obj = self.v_ego + v_rel
       if not (_finite(dist, y_left, v_rel) and _RADAR_MIN_DIST < dist < _SANE_DIST and abs(y_left) < _SANE_OFFSET and
-              _RADAR_MIN_OBJ_SPEED < v_obj < _SANE_SPEED):
+              max(_RADAR_MIN_OBJ_SPEED, _RADAR_MIN_OBJ_SPEED_SHARE * self.v_ego) < v_obj < _SANE_SPEED):
         continue
 
       # The radar measures straight ahead of the car. Our path may curve, so measure from the path. Positive = right.
@@ -681,16 +696,21 @@ class SmartCruiseControlMerge:
       decel_to_wait = closing ** 2 / (2. * max(dist - _WAIT_GAP, 1.)) if closing > 0. else 0.
       cannot_wait = decel_to_wait > _WAIT_MAX_DECEL and abs(offset) > _WAIT_WIDE_OFFSET
       can_pass = can_pass or cannot_wait
+      arrival = min(time_to_lane, _FIT_MAX_ARRIVAL_TIME)
+      fits_ahead = (dist / max(self.v_ego, 0.1) > _FIT_GAP_NOW and
+                    (dist - max(closing, 0.) * arrival) / max(self.v_ego, 0.1) > _FIT_GAP_ON_ARRIVAL)
+      if fits_ahead and closing < _FIT_IGNORE_CLOSING:
+        can_pass = True  # comes in ahead with room and we are not catching it: nothing to do
       if can_pass and not follow and (converging or early or blinker or lane_ending):
         # We are past before it gets here: keep our speed, it comes in behind us.
         self.passes += 1
         self.last_pass = (slot, dist, closing, time_to_pass, time_it_needs,
                           5 if converging else 8 if early else 9 if blinker else 4)
         converging = early = blinker = lane_ending = False
-      elif blinker or lane_ending:
+      elif (blinker or lane_ending) and v_obj < self.v_ego - _READY_MIN_SLOWER:
         self.ready_frames = _FRAMES(_READY_HOLD_TIME)
 
-      if (dist < _READY_MAX_DIST and v_obj < self.v_ego + _READY_MAX_FASTER and track.moved_closer_early > _READY_MOVE and
+      if (dist < _READY_MAX_DIST and v_obj < self.v_ego - _READY_MIN_SLOWER and track.moved_closer_early > _READY_MOVE and
           track.closing_speed > _RADAR_CONVERGE_SPEED[0] and not can_pass):
         self.ready_frames = _FRAMES(_READY_HOLD_TIME)
 
@@ -701,9 +721,6 @@ class SmartCruiseControlMerge:
         trigger = (TRIGGER_RADAR_CONVERGING if converging else TRIGGER_RADAR_FOLLOW if follow else
                    TRIGGER_RADAR_EARLY if early else TRIGGER_LANE_ENDING if lane_ending else
                    TRIGGER_BLINKER if blinker else TRIGGER_RADAR_SLOW)
-        arrival = min(time_to_lane, _FIT_MAX_ARRIVAL_TIME)
-        fits_ahead = (dist / max(self.v_ego, 0.1) > _FIT_GAP_NOW and
-                      (dist - max(closing, 0.) * arrival) / max(self.v_ego, 0.1) > _FIT_GAP_ON_ARRIVAL)
         candidate = MergeCandidate(dist, offset, track.closing_speed, v_obj, trigger, slot, fits_ahead)
         if trigger == TRIGGER_RADAR_SLOW:
           slow_candidates.append(candidate)  # decided below, once the whole line has been seen
@@ -759,6 +776,12 @@ class SmartCruiseControlMerge:
     if watching and dt > 0.:
       camera = self._find_candidate(md, dt)
       radar = self._find_radar_candidate(sm, md, dt)
+      self.radar_seen_frames = max(0, self.radar_seen_frames - 1)
+      if camera is not None and (self.radar_seen_frames > 0 or camera.dist < _CAMERA_MIN_DIST or
+                                 camera.v_lead < _CAMERA_MIN_SPEED_SHARE * self.v_ego):
+        # The radar is the better judge of other vehicles, so with it working the camera's guesses are not used.
+        # Without it, a "vehicle" a few metres ahead or nearly standing still on a highway is not a merging car.
+        camera = None
       # Whichever asks for the lower speed wins.
       if camera is not None and radar is not None:
         self.candidate = camera if camera.wanted_speed(self.v_ego) <= radar.wanted_speed(self.v_ego) else radar

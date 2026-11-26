@@ -438,6 +438,26 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     assert self.scc.state == MergeState.slowing
     np.testing.assert_allclose(self.scc.output_v_target, 25. - 20 * CV.MPH_TO_MS, atol=1e-3)
 
+  def test_camera_phantoms_are_not_merging_cars(self):
+    # recorded 2026-11-26 09:28 and 16:10: the camera reported a "vehicle" 4 m ahead doing 2 mph while we did 68
+    self.run_scene(3., lat_speed=0.8, stop_y=1.2)
+    assert self.scc.state == MergeState.slowing            # the same scene with a believable vehicle does trigger
+    for kw in ({'dist': 4.}, {'dist': 6., 'v': 1.}, {'v': 1.}, {'v': 4.}):
+      self.scc = SmartCruiseControlMerge()
+      self.run_scene(3., lat_speed=0.8, stop_y=1.2, **kw)
+      assert self.scc.state == MergeState.enabled and self.scc.output_v_target == V_CRUISE_UNSET, kw
+
+  def test_camera_guesses_are_not_used_while_the_radar_works(self):
+    self.scc.radar_seen_frames = 10 ** 6
+    self.run_scene(3., lat_speed=0.8, stop_y=1.2)
+    assert self.scc.state == MergeState.enabled and self.scc.output_v_target == V_CRUISE_UNSET
+
+  def test_radar_counts_as_working_for_a_while_after_its_last_object(self):
+    self.run_radar(0.5, [{'slot': 5, 'dist': 60., 'right': 3.6, 'v': V_EGO}])
+    assert self.scc.radar_seen_frames > 20 * 25
+    self.run_scene(3., lat_speed=0.8, stop_y=1.2)
+    assert self.scc.state == MergeState.enabled
+
   def test_cruise_speed_not_set(self):
     self.run_scene(3., lat_speed=0.8, stop_y=1.2, v_cruise=V_CRUISE_UNSET * CV.KPH_TO_MS)
     assert self.scc.state == MergeState.enabled
@@ -502,7 +522,8 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
           if rng.random() < 0.02:
             lead.x = [num(0., 100., 0.5) for _ in range(rng.choice([0, 1, 6]))]
           leads.append(lead)
-        md = make_model(leads, num(-0.003, 0.003, 0.), None if rng.random() < 0.97 else rng.choice([0, 5, 10 ** 9]))
+        bend = num(-0.003, 0.003, 0.)
+        md = make_model(leads, 0. if scenario % 3 == 0 else bend, None if rng.random() < 0.97 else rng.choice([0, 5, 10 ** 9]))  # steady road for the merge
         if scenario % 2 == 0:
           add_lanes(md, right_lane_ends=scenario % 4 == 0, left_lane_ends=scenario % 8 == 0, edge_std=num(0., 2., 0.05),
                     line_prob=num(0., 1., 0.05))
@@ -518,6 +539,12 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
           pts = [(rng.randrange(32), num(0., 180.), num(-10., 10.), num(-5., 45.), num(0., 45.)) for _ in range(rng.choice([0, 3, 12, 32]))]
           if scenario % 3 == 1:
             pts.append((1, max(5., 120. - i * 0.6), 6.6, 18., 30.))
+          if scenario % 3 == 0:
+            # the believable merge again, as the radar sees it (with the radar working, the camera's guess is not used)
+            if scenario % 2 == 0:
+              pts = []  # half the time without the random clutter around it
+            for dist, y, _v, lat, _prob in seeds:
+              pts.append((40, min(dist, 32.), max(1.6, 4.4 - lat * i * DT_MDL), v_ego - 4., v_ego))  # slot no noise point uses
           sm_fuzz['carStateSP'] = make_radar(pts)
         self.scc.update(sm_fuzz, long_enabled, override, v_ego, num(-3., 3.), v_cruise)
 
@@ -528,7 +555,7 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
           assert not self.scc.is_active
           assert out == V_CRUISE_UNSET
         if out != V_CRUISE_UNSET:
-          assert self.scc.is_active and not self.scc.test_only
+          assert (self.scc.is_active or self.scc.ready) and not self.scc.test_only
           assert MIN_V_TARGET <= out <= v_cruise
           assert out >= self.scc.v_ref - self.scc.max_drop - 1e-6
           assert out >= self.scc.v_ref - 40 * CV.MPH_TO_MS - 1e-6
@@ -667,7 +694,7 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     self.run_radar(3., [{'slot': 5, 'dist': 45., 'right': 3.6, 'v': V_EGO - 2., 'lat_speed': 0.7, 'stop': 1.5}])
     assert self.scc.state == MergeState.slowing
     assert self.scc.candidate.trigger == TRIGGER_RADAR_CONVERGING
-    assert self.scc.output_v_target < V_EGO - 2.
+    assert self.scc.output_v_target <= V_EGO - 2. + 1e-6   # 45 m ahead: room is there, so its speed and no lower
 
   def test_radar_faster_vehicle_moving_in_is_ignored(self):
     self.params.put_bool("SmartCruiseControlMergeBothSides", True, block=True)
@@ -792,7 +819,7 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
   def test_follow_lets_go_of_a_car_that_stays_beside_us(self):
     # It moved toward us once, then just drives along in its lane, matching our speed. Do not hold the speed down for ever.
     v = 56 * CV.MPH_TO_MS
-    states, triggers, targets = self.run_phases([(2., 0.), (1.5, 0.6), (_RADAR_FOLLOW_TIME + _HOLD_TIME + 4., 0.)], v_obj=v, v_ego=v)
+    states, triggers, targets = self.run_phases([(2., 0.), (1.5, 0.6), (_RADAR_FOLLOW_TIME + _HOLD_TIME + 4., 0.)], v_obj=v, v_ego=v, dist=22.)
     assert self.count_events(states) == 1
     assert states[-1] == MergeState.enabled
 
@@ -904,11 +931,11 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
 
   def test_ready_brings_set_speed_to_our_speed_without_slowing(self):
     # Recorded Nov 25: in traffic at 58 mph with the cruise set to 70. A car far to the right drifts our way slowly.
-    out, _ = self.run_tracking([(1.5, 0.), (3., 0.5)], right=8.4, dist=60., v_obj=54 * CV.MPH_TO_MS)
+    out, _ = self.run_tracking([(1.5, 0.), (3., 0.5)], right=8.4, dist=28., v_obj=54 * CV.MPH_TO_MS)
     v_ego = 58 * CV.MPH_TO_MS
     ready = [o for o in out if o[0] == MergeState.enabled and o[2] != V_CRUISE_UNSET]
     assert ready, "expected the set speed to be prepared before any slowdown"
-    assert all(v_ego < o[2] <= v_ego + 1.1 for o in ready)
+    assert all(v_ego + 2. < o[2] <= v_ego + 2.6 for o in ready)   # room left to speed up and go by
     first_slow = next((i for i, o in enumerate(out) if o[0] == MergeState.slowing), len(out))
     first_ready = next(i for i, o in enumerate(out) if o[2] != V_CRUISE_UNSET)
     assert first_ready < first_slow
@@ -927,7 +954,7 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     assert all(o[2] == V_CRUISE_UNSET for o in out)
 
   def test_ready_ends_when_the_car_stops_coming(self):
-    out, _ = self.run_tracking([(1.5, 0.), (1.5, 0.5), (8., 0.)], right=8.4, dist=60., v_obj=58 * CV.MPH_TO_MS)
+    out, _ = self.run_tracking([(1.5, 0.), (1.5, 0.5), (8., 0.)], right=8.4, dist=28., v_obj=54 * CV.MPH_TO_MS)
     assert any(o[2] != V_CRUISE_UNSET for o in out)
     assert out[-1][2] == V_CRUISE_UNSET
 
