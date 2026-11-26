@@ -51,6 +51,8 @@ class LongitudinalPlannerSP:
     self.scc.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)
     if self.scc.merge.fault_alert:
       self.events_sp.add(EventNameSP.mergeAssistFault)
+    elif self.scc.merge.brake_warning:
+      self.events_sp.add(EventNameSP.mergeAssistBrake)
     elif self.scc.merge.state == MergeState.slowing:
       self.events_sp.add(EventNameSP.mergeAssistTest if self.scc.merge.test_only else EventNameSP.mergeAssistSlowing)
     elif self.scc.exit_watch.split:
@@ -136,6 +138,8 @@ class LongitudinalPlannerSP:
     sccMerge.leadsLateralOffset = [float(v) for v in merge.debug_offset]
     sccMerge.leadsSpeed = [float(v) for v in merge.debug_speed]
     sccMerge.radarObjects = int(merge.radar_objects)
+    sccMerge.ready = bool(merge.ready)
+    sccMerge.brakeWarning = bool(merge.brake_warning)
     exit_watch = self.scc.exit_watch
     sccMerge.exitSplit = bool(exit_watch.split)
     sccMerge.exitFollowing = bool(exit_watch.following)

@@ -274,6 +274,8 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
       exitDrift @23 :Float32; # m, planned path off the lane centre toward that side.
       exitLeadDistance @24 :Float32;
       exitLaneWidening @25 :Float32; # m
+      ready @26 :Bool; # Set speed is being brought down to our own speed because a vehicle beside us is drifting our way.
+      brakeWarning @27 :Bool; # The gap to a vehicle coming in is closing faster than the cruise can handle.
     }
 
     enum MergeState {
@@ -405,6 +407,7 @@ struct OnroadEventSP @0xda96579883444c35 {
     mergeAssistTest @27;
     mergeAssistFault @28;
     exitWatchTest @29;
+    mergeAssistBrake @30;
   }
 }
 

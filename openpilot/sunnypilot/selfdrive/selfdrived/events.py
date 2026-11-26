@@ -233,6 +233,14 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 5.),
   },
 
+  EventNameSP.mergeAssistBrake: {
+    ET.WARNING: Alert(
+      "BRAKE: car merging in",
+      "Cruise cannot slow down fast enough",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.MID, VisualAlert.none, AudibleAlert.prompt, 1.),
+  },
+
   EventNameSP.mergeAssistSlowing: {
     ET.WARNING: Alert(
       "Slowing for merging vehicle",

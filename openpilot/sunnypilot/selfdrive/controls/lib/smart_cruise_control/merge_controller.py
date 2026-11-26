@@ -121,7 +121,21 @@ _RADAR_TRACK_JUMP_DIST = 4.  # m between frames: the radar reused the slot for a
 _RADAR_EARLY_WINDOW = 1.  # s
 _RADAR_EARLY_MOVE = 1.2  # m toward our path within that window. An ordinary lane change is slower than this
 _RADAR_EARLY_TIME_TO_LANE = 4.  # s until it reaches our lane at its current sideways speed
-_RADAR_EARLY_DELTA = 5. * CV.MPH_TO_MS  # we may still be this much faster than it
+_RADAR_EARLY_DELTA = 0.  # match its speed. The cruise slows so gently that a softer first step only wastes time
+# Get ready: this car can only slow down by pressing the cruise 'speed down' button, and the set speed often sits
+# well above the speed we are really driving (traffic). Pressing it down to our speed takes seconds and slows nothing.
+# So when a vehicle beside us starts drifting our way, do that part in advance. It does not slow the car.
+_READY_MOVE = 0.35  # m toward our path within the early window
+_READY_MAX_DIST = 80.  # m
+_READY_MAX_FASTER = 2.  # m/s
+_READY_HOLD_TIME = 2.  # s
+_READY_MARGIN = 1.  # m/s above our speed: never below it, so getting ready cannot slow us
+# Brake warning: the cruise cannot brake. Tell the driver when the gap is closing faster than it can handle.
+_BRAKE_WARN_MIN_CLOSING = 2.  # m/s
+_BRAKE_WARN_HEADWAY = 0.8  # s of following distance we want to keep to the vehicle coming in
+_BRAKE_WARN_DECEL = 1.0  # m/s2 needed to keep that distance. The cruise manages about half of this
+_BRAKE_WARN_MAX_OFFSET = 4.  # m. It must be next to our lane or entering it
+_BRAKE_WARN_HOLD_TIME = 1.5  # s
 _RADAR_EARLY_MAX_DIST = 60.  # m. Further out the radar's sideways reading is too jumpy to act on a short move
 # Follow-through: once a vehicle made us slow down, keep the lower speed until it is in our lane or clearly not coming.
 _RADAR_FOLLOW_TIME = 8.  # s after the last real trigger. A vehicle that just drives next to us is let go after this
@@ -308,6 +322,10 @@ class SmartCruiseControlMerge:
     self.follow_slot = -1
     self.follow_side = 1.
     self.follow_frames = 0
+    self.ready_frames = 0
+    self.ready = False  # the set speed is being brought down to our own speed, nothing more
+    self.brake_warning_frames = 0
+    self.brake_warning = False
     self.event_v_lead = 0.
     self.event_make_room = False
     self.lane_ending_frames = {1.: 0, -1.: 0}
@@ -356,6 +374,8 @@ class SmartCruiseControlMerge:
     self.radar_objects = 0
     self.follow_slot = -1
     self.follow_frames = 0
+    self.ready_frames = 0
+    self.brake_warning_frames = 0
     for side in self.lane_ending:
       self.lane_ending[side] = False
       self.lane_ending_frames[side] = 0
@@ -533,6 +553,10 @@ class SmartCruiseControlMerge:
       follow = (not converging and slot == self.follow_slot and self.follow_frames > 0 and self.state in ACTIVE_STATES and
                 offset * self.follow_side > 0. and abs(offset) < _RADAR_FOLLOW_MAX_OFFSET and dist < _RADAR_CONVERGE_MAX_DIST and
                 v_obj < self.v_ego + _RADAR_FOLLOW_MAX_FASTER and track.closing_speed > -_RADAR_FOLLOW_MAX_AWAY)
+
+      if (dist < _READY_MAX_DIST and v_obj < self.v_ego + _READY_MAX_FASTER and track.moved_closer_early > _READY_MOVE and
+          track.closing_speed > _RADAR_CONVERGE_SPEED[0]):
+        self.ready_frames = _FRAMES(_READY_HOLD_TIME)
 
       if converging or slow or follow or early:
         trigger = (TRIGGER_RADAR_CONVERGING if converging else TRIGGER_RADAR_FOLLOW if follow else
@@ -765,6 +789,35 @@ class SmartCruiseControlMerge:
 
     self.output_v_target = self.get_v_target_from_control()
     self.output_a_target = self.get_a_target_from_control()
+    self._update_ready()
+    self._update_brake_warning()
+
+  def _update_ready(self) -> None:
+    """Bring the set speed down to just above our own speed while a vehicle beside us drifts our way."""
+    self.ready_frames = max(0, self.ready_frames - 1)
+    self.ready = False
+    if (self.ready_frames == 0 or self.state != MergeState.enabled or self.test_only or self.fault or
+        self.output_v_target != V_CRUISE_UNSET):
+      return
+    cruise = self.v_cruise_setpoint
+    if not (_finite(cruise, self.v_ego, self.max_drop) and MIN_V_TARGET < cruise < MAX_V_CRUISE):
+      return
+    v = max(self.v_ego + _READY_MARGIN, cruise - self.max_drop, MIN_V_TARGET)
+    if v < cruise - 0.5:
+      self.v_ref = cruise
+      self.output_v_target = float(v)
+      self.ready = True
+
+  def _update_brake_warning(self) -> None:
+    self.brake_warning_frames = max(0, self.brake_warning_frames - 1)
+    c = self.candidate
+    if (self.state == MergeState.slowing and c is not None and c.trigger != TRIGGER_RADAR_SLOW and
+        _finite(c.dist, c.v_lead, c.offset, self.v_ego) and abs(c.offset) < _BRAKE_WARN_MAX_OFFSET):
+      closing = self.v_ego - c.v_lead
+      room = max(c.dist - _BRAKE_WARN_HEADWAY * self.v_ego, 2.)
+      if closing > _BRAKE_WARN_MIN_CLOSING and closing ** 2 / (2. * room) > _BRAKE_WARN_DECEL:
+        self.brake_warning_frames = _FRAMES(_BRAKE_WARN_HOLD_TIME)
+    self.brake_warning = self.brake_warning_frames > 0 and self.state in ACTIVE_STATES and not self.fault
 
   def update(self, sm: messaging.SubMaster, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float,
              v_cruise_setpoint: float) -> None:

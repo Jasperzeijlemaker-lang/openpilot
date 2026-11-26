@@ -141,9 +141,14 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     assert math.isfinite(out)
     assert math.isfinite(self.scc.output_a_target)
     if out != V_CRUISE_UNSET:
-      assert self.scc.is_active and not self.scc.test_only and not self.scc.fault
+      assert (self.scc.is_active or self.scc.ready) and not self.scc.test_only and not self.scc.fault
       assert MIN_V_TARGET <= out <= v_cruise
       assert out >= self.scc.v_ref - self.scc.max_drop - 1e-6
+    if self.scc.ready:
+      # getting ready may never ask for less than our own speed
+      assert out != V_CRUISE_UNSET and out >= self.scc.v_ego and self.scc.state == MergeState.enabled
+    if self.scc.brake_warning:
+      assert self.scc.state in (MergeState.slowing, MergeState.holding)
 
   def test_initial_state(self):
     assert self.scc.state == MergeState.disabled
@@ -858,7 +863,7 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     assert first[3] > 5.5  # still more than a lane and a half away when we start
     # gentle at first: not below its speed while it is still far out
     early = [o[2] for o in out if o[1] == TRIGGER_RADAR_EARLY and o[2] != V_CRUISE_UNSET]
-    assert early and min(early) >= v_obj
+    assert early and min(early) >= v_obj - 0.01
     # then the normal response takes over, in the same event
     assert any(o[1] == TRIGGER_RADAR_CONVERGING for o in out)
     states = [o[0] for o in out]
@@ -894,3 +899,58 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     v = 58 * CV.MPH_TO_MS
     out, _ = self.run_tracking([(2.5, 1.6)], right=8.6, dist=85., v_obj=v, v_ego=v)
     assert all(o[1] != TRIGGER_RADAR_EARLY for o in out)
+
+  # ---------- getting ready, and the brake warning ----------
+
+  def test_ready_brings_set_speed_to_our_speed_without_slowing(self):
+    # Recorded Nov 25: in traffic at 58 mph with the cruise set to 70. A car far to the right drifts our way slowly.
+    out, _ = self.run_tracking([(1.5, 0.), (3., 0.5)], right=8.4, dist=60., v_obj=54 * CV.MPH_TO_MS)
+    v_ego = 58 * CV.MPH_TO_MS
+    ready = [o for o in out if o[0] == MergeState.enabled and o[2] != V_CRUISE_UNSET]
+    assert ready, "expected the set speed to be prepared before any slowdown"
+    assert all(v_ego < o[2] <= v_ego + 1.1 for o in ready)
+    first_slow = next((i for i, o in enumerate(out) if o[0] == MergeState.slowing), len(out))
+    first_ready = next(i for i, o in enumerate(out) if o[2] != V_CRUISE_UNSET)
+    assert first_ready < first_slow
+
+  def test_ready_is_silent_in_test_only(self):
+    self.params.put_bool("SmartCruiseControlMergeTestOnly", True, block=True)
+    self.scc = SmartCruiseControlMerge()
+    out, _ = self.run_tracking([(1.5, 0.), (3., 0.5)], right=8.4, dist=60., v_obj=54 * CV.MPH_TO_MS)
+    assert all(o[2] == V_CRUISE_UNSET for o in out)
+
+  def test_ready_not_for_a_car_holding_its_lane_or_a_faster_one(self):
+    out, _ = self.run_tracking([(6., 0.)], right=3.6, dist=40., v_obj=54 * CV.MPH_TO_MS)
+    assert all(o[2] == V_CRUISE_UNSET for o in out)
+    v = 58 * CV.MPH_TO_MS
+    out, _ = self.run_tracking([(1.5, 0.), (3., 0.5)], right=8.4, dist=60., v_obj=v + 4., v_ego=v)
+    assert all(o[2] == V_CRUISE_UNSET for o in out)
+
+  def test_ready_ends_when_the_car_stops_coming(self):
+    out, _ = self.run_tracking([(1.5, 0.), (1.5, 0.5), (8., 0.)], right=8.4, dist=60., v_obj=58 * CV.MPH_TO_MS)
+    assert any(o[2] != V_CRUISE_UNSET for o in out)
+    assert out[-1][2] == V_CRUISE_UNSET
+
+  def brake_flags(self, **kw):
+    flags = []
+    orig = self.scc.update
+
+    def wrapped(*a, **k):
+      orig(*a, **k)
+      flags.append(self.scc.brake_warning)
+    self.scc.update = wrapped
+    try:
+      self.run_tracking(**kw)
+    finally:
+      self.scc.update = orig
+    return flags
+
+  def test_brake_warning_for_close_slow_cut_in(self):
+    # Recorded Nov 25: a 51 mph car pulls out of a slow line 29 m ahead while we do 66.
+    flags = self.brake_flags(phases=[(1.5, 0.), (2., 1.5)], right=3.6, dist=40., v_obj=51 * CV.MPH_TO_MS, v_ego=66 * CV.MPH_TO_MS)
+    assert any(flags)
+
+  def test_no_brake_warning_for_a_comfortable_merge(self):
+    # Same sideways move, but 60 m ahead and only 6 mph slower: the cruise can deal with that.
+    flags = self.brake_flags(phases=[(1.5, 0.), (3., 1.0)], right=4.2, dist=60., v_obj=56 * CV.MPH_TO_MS, v_ego=62 * CV.MPH_TO_MS)
+    assert not any(flags)

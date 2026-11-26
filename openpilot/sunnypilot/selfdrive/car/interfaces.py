@@ -89,11 +89,37 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
   set_speed_limit_assist_availability(CP, CP_SP, params)
 
 
+# Steering strength measured on the owner's own car, used in place of a generic placeholder.
+# value = sideways acceleration (m/s^2) the car reaches at full steering command.
+# Ioniq 6: the stock entry is a placeholder (2.5). The device's own estimator measured 3.04 over 6,166 points
+# (drive 2026-11-25). With 2.5 every correction is about 20% too strong, and the steering rings after a bump.
+MEASURED_LAT_ACCEL_FACTOR = {
+  "HYUNDAI_IONIQ_6": (2.5, 3.0),  # (placeholder we replace, measured value)
+}
+
+
+def _apply_measured_torque_tune(CP: structs.CarParams) -> bool:
+  """Only touches the listed cars, only torque steering, and only while the placeholder is still in place,
+  so a value from upstream, Self-Tune or the manual tuning settings is never overwritten."""
+  try:
+    entry = MEASURED_LAT_ACCEL_FACTOR.get(str(CP.carFingerprint))
+    if entry is None or CP.lateralTuning.which() != 'torque':
+      return False
+    placeholder, measured = entry
+    if not abs(float(CP.lateralTuning.torque.latAccelFactor) - placeholder) <= 1e-3:
+      return False
+    CP.lateralTuning.torque.latAccelFactor = measured
+    return True
+  except Exception:
+    return False
+
+
 def setup_interfaces(CI: CarInterfaceBase, params: Params | None = None) -> None:
   enforce_torque = _enforce_torque_lateral_control(CI.CP, params)
   nnlc_enabled = _initialize_neural_network_lateral_control(CI.CP, CI.CP_SP, params)
   _initialize_intelligent_cruise_button_management(CI.CP, CI.CP_SP, params)
   _initialize_torque_lateral_control(CI, CI.CP, enforce_torque, nnlc_enabled)
+  _apply_measured_torque_tune(CI.CP)
   _cleanup_unsupported_params(CI.CP, CI.CP_SP)
 
   try:
