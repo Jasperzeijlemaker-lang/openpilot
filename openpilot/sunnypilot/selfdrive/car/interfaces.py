@@ -98,14 +98,10 @@ MEASURED_LAT_ACCEL_FACTOR = {
   "HYUNDAI_IONIQ_6": (2.5, 3.0),  # (placeholder that gets replaced, measured value)
 }
 
-# Steering friction: the share of full steering command needed just to get the rack moving.
-# Ioniq 6: sunnypilot's 0.005 is a placeholder (in effect "no friction"). On this car the rack visibly sticks: in the
-# recorded wobble (2026-11-25, 17:10) the wheel sits still while the command ramps, then jumps, about once every 0.8 s.
-# Measured: 0.063 by the device's own estimator, 0.04 to 0.07 from the drive log (gap between the left-moving and
-# right-moving branches). The sister car Ioniq 5 ships with 0.096. 0.05 is the cautious end of that range.
-MEASURED_FRICTION = {
-  "HYUNDAI_IONIQ_6": (0.005, 0.05),  # (placeholder that gets replaced, measured value)
-}
+# Steering friction is left at sunnypilot's value on purpose. A measured 0.05 was tried on 2026-11-26 (commit
+# 886b42b) and the wobble was no better: friction acts like extra gain around the centre, and this car's wobble is
+# a gain problem (see latcontrol_torque_car_gain.py). No entries: nothing is replaced.
+MEASURED_FRICTION: dict[str, tuple[float, float]] = {}
 
 
 def _apply_measured_torque_tune(CP: structs.CarParams) -> bool:

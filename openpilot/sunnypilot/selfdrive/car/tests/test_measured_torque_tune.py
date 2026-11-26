@@ -14,7 +14,7 @@ class TestMeasuredTorqueTune:
     cp = make_cp("HYUNDAI_IONIQ_6")
     assert _apply_measured_torque_tune(cp)
     assert cp.lateralTuning.torque.latAccelFactor == 3.0
-    assert cp.lateralTuning.torque.friction == 0.05
+    assert cp.lateralTuning.torque.friction == 0.005  # friction is left alone (tried 0.05 on 2026-11-26: no better)
     assert cp.lateralTuning.torque.latAccelOffset == 0.  # nothing else changes
 
   def test_real_car_params_object(self):
@@ -25,7 +25,7 @@ class TestMeasuredTorqueTune:
     cp.lateralTuning.torque.friction = 0.005
     assert _apply_measured_torque_tune(cp)
     assert abs(cp.lateralTuning.torque.latAccelFactor - 3.0) < 1e-6
-    assert abs(cp.lateralTuning.torque.friction - 0.05) < 1e-6
+    assert abs(cp.lateralTuning.torque.friction - 0.005) < 1e-6
     assert not _apply_measured_torque_tune(cp)  # second call changes nothing more
 
   def test_other_cars_are_untouched(self):
@@ -34,13 +34,12 @@ class TestMeasuredTorqueTune:
       assert not _apply_measured_torque_tune(cp)
       assert cp.lateralTuning.torque.latAccelFactor == 2.5 and cp.lateralTuning.torque.friction == 0.005
 
-  def test_each_value_is_replaced_on_its_own(self):
-    cp = make_cp("HYUNDAI_IONIQ_6", factor=3.2)            # strength already real, friction still the placeholder
-    assert _apply_measured_torque_tune(cp)
-    assert cp.lateralTuning.torque.latAccelFactor == 3.2 and cp.lateralTuning.torque.friction == 0.05
-    cp = make_cp("HYUNDAI_IONIQ_6", friction=0.09)         # the other way round
-    assert _apply_measured_torque_tune(cp)
-    assert cp.lateralTuning.torque.latAccelFactor == 3.0 and cp.lateralTuning.torque.friction == 0.09
+  def test_friction_is_never_touched(self):
+    assert MEASURED_FRICTION == {}
+    for friction in (0.005, 0.09):
+      cp = make_cp("HYUNDAI_IONIQ_6", friction=friction)
+      assert _apply_measured_torque_tune(cp)
+      assert cp.lateralTuning.torque.latAccelFactor == 3.0 and cp.lateralTuning.torque.friction == friction
 
   def test_a_value_someone_else_set_is_kept(self):
     # upstream gets real numbers one day, or the value was already changed: leave it alone
