@@ -5,7 +5,7 @@ import types
 import numpy as np
 import pytest
 
-from openpilot.sunnypilot.selfdrive.blinker import blinkerd, blinker_report
+from openpilot.sunnypilot.selfdrive.blinker import beacon, blinkerd, blinker_report
 from openpilot.sunnypilot.selfdrive.blinker.sim import Scene, RPY, CAM_HEIGHT
 from openpilot.sunnypilot.selfdrive.blinker.tests.test_blinker import FakeBuf
 
@@ -16,7 +16,7 @@ class Done(BaseException):
 
 class FakeLog:
   def __init__(self):
-    self.events, self.errors = [], []
+    self.events, self.errors, self.notes = [], [], []
 
   def event(self, name, **kw):
     self.events.append(kw)
@@ -74,9 +74,17 @@ def install(monkeypatch, frames, enabled=True, connect_fails=0, recv_errors=(), 
       return self.data[k]
 
   class Params:
+    def __init__(self, path=""):
+      assert path in ("", "/dev/shm/params")
+      self.memory_only = bool(path)
+
     def get_bool(self, key):
-      assert key == "BlinkerWatch"
+      assert key == "BlinkerWatch" and not self.memory_only
       return enabled
+
+    def put(self, key, value):
+      assert self.memory_only and key == "BlinkerWatchSeen"      # never written to the device's storage
+      log.notes.append(value)
 
   mods = {
     "msgq": types.ModuleType("msgq"),
@@ -116,13 +124,19 @@ def test_loop_reports_a_flashing_vehicle(monkeypatch):
   hits = flashing(log)
   assert log.events[0] == {"what": "started", "error": True} and all(e["error"] is True for e in log.events) and 2 <= len(hits) <= 6
   assert all(h["side"] == "right" and h["slot"] == 7 and 13 < h["dist"] < 21 for h in hits) and not log.errors
+  # the notes for Merge Assist: about 5 a second while it flashes, each readable and pointing at the same vehicle
+  assert 10 <= len(log.notes) <= 25
+  for note in log.notes:
+    stamp = float(note.split("|")[1])
+    seen = beacon.decode(note, stamp, 1.)
+    assert list(seen) == [7] and seen[7][0] == 1 and 13 < seen[7][1] < 21
 
 
 def test_loop_is_quiet_without_a_signal(monkeypatch):
   log = install(monkeypatch, scene_frames(brake=True))
   with pytest.raises(Done):
     blinkerd.run()
-  assert not flashing(log) and not log.errors
+  assert not flashing(log) and not log.errors and not log.notes
 
 
 def test_switched_off_means_no_looking(monkeypatch):

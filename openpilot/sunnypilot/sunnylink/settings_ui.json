@@ -1100,8 +1100,15 @@
                 {
                   "key": "BlinkerWatch",
                   "widget": "toggle",
-                  "title": "Blinker Watch (watch only)",
-                  "description": "Looks at the road camera for vehicles flashing a turn signal and writes what it sees to the drive log. It does not change speed or steering yet. Takes effect on the next drive."
+                  "title": "Blinker Detection",
+                  "description": "Looks at the road camera for vehicles flashing a turn signal. A vehicle in the next lane signalling toward your lane: Merge Assist starts slowing early. A slow vehicle signalling away from you: Merge Assist does not hang back for it. Never steers. Takes effect on the next drive.",
+                  "enablement": [
+                    {
+                      "type": "param",
+                      "key": "SmartCruiseControlMerge",
+                      "equals": true
+                    }
+                  ]
                 },
                 {
                   "key": "SmartCruiseControlMergeMaxDrop",

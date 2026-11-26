@@ -35,6 +35,7 @@ Failsafes, in the order they apply:
   7. Gas pedal, cruise off, our own turn signal, low speed, or the toggle going off all cancel at once.
 """
 import math
+import time
 from collections import deque
 
 import numpy as np
@@ -47,6 +48,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
+from openpilot.sunnypilot.selfdrive.blinker import beacon
 
 MergeState = custom.LongitudinalPlanSP.SmartCruiseControl.MergeState
 
@@ -94,6 +96,14 @@ _LANE_END_TIME = 0.5  # s. The lane must look like it ends for this long
 
 TRIGGER_NONE, TRIGGER_MEASURED, TRIGGER_PREDICTED, TRIGGER_ENCROACHING, TRIGGER_LANE_ENDING = range(5)
 TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW, TRIGGER_RADAR_FOLLOW, TRIGGER_RADAR_EARLY = 5, 6, 7, 8
+TRIGGER_BLINKER = 9
+
+# Turn signals seen by Blinker Watch (camera). A signal is a hint, not a move: it gives a head start, nothing more.
+_BLINKER_MAX_AGE = 1.2  # s. Blinker Watch repeats its note 5 times a second while a signal is flashing
+_BLINKER_READ_EVERY = 4  # model frames between looks at the note
+_BLINKER_MATCH_DIST = 6.  # m. The note and the radar must agree on where that vehicle is
+_BLINKER_MAX_DIST = 60.  # m
+_BLINKER_DELTA = 5. * CV.MPH_TO_MS  # signalling toward our lane: come down to its speed plus this, before it moves
 
 # --- The car's own radar (when it reports its object list, see sunnypilot/selfdrive/car/merge_radar.py) ---
 # Unlike the camera model, the radar reports vehicles in the lanes beside us. Two things are acted on:
@@ -201,6 +211,9 @@ class MergeCandidate:
     if self.trigger == TRIGGER_RADAR_SLOW:
       # Defensive: keep passing, but not much faster than the vehicles beside us.
       return self.v_lead + _RADAR_PASS_DELTA
+    if self.trigger == TRIGGER_BLINKER:
+      # It has only signalled. Take most of the speed difference out; a real move over is handled by the other triggers.
+      return self.v_lead + _BLINKER_DELTA
     if self.trigger == TRIGGER_RADAR_EARLY:
       # Proactive: take most of the speed difference out before it arrives.
       return self.v_lead + _RADAR_EARLY_DELTA
@@ -308,6 +321,10 @@ class SmartCruiseControlMerge:
     self.enabled = False
     self.test_only = True
     self.both_sides = False
+    self.use_blinkers = False
+    self.blinkers: dict[int, tuple[int, float]] = {}  # radar slot -> (signal side: -1 left, +1 right; distance)
+    self.mem_params = None
+    self.clock = time.monotonic
     self.max_drop = _DEFAULT_MAX_DROP_MPH * CV.MPH_TO_MS
 
     self.state = MergeState.disabled
@@ -357,6 +374,7 @@ class SmartCruiseControlMerge:
     self.enabled = self.params.get_bool("SmartCruiseControlMerge")
     self.test_only = self.params.get_bool("SmartCruiseControlMergeTestOnly")
     self.both_sides = self.params.get_bool("SmartCruiseControlMergeBothSides")
+    self.use_blinkers = self.params.get_bool("BlinkerWatch")
     try:
       max_drop_mph = float(self.params.get("SmartCruiseControlMergeMaxDrop", return_default=True))
     except (TypeError, ValueError):
@@ -371,6 +389,20 @@ class SmartCruiseControlMerge:
 
   # ----- detection -----
 
+  def _read_blinkers(self) -> None:
+    """Which vehicles Blinker Watch currently sees signalling. Any problem here means 'none', never a fault."""
+    if self.frame % _BLINKER_READ_EVERY != 0:
+      return
+    self.blinkers = {}
+    if not self.use_blinkers:
+      return
+    try:
+      if self.mem_params is None:
+        self.mem_params = Params(beacon.MEM_PARAMS_PATH)
+      self.blinkers = beacon.decode(self.mem_params.get(beacon.KEY), self.clock(), _BLINKER_MAX_AGE)
+    except Exception:
+      self.blinkers = {}
+
   def _reset_tracking(self) -> None:
     for track in self.tracks:
       track.reset()
@@ -381,6 +413,7 @@ class SmartCruiseControlMerge:
     self.follow_slot = -1
     self.follow_frames = 0
     self.ready_frames = 0
+    self.blinkers = {}
     self.brake_warning_frames = 0
     for side in self.lane_ending:
       self.lane_ending[side] = False
@@ -530,6 +563,7 @@ class SmartCruiseControlMerge:
 
     for track in self.radar_tracks.values():
       track.updated = False
+    self._read_blinkers()
 
     max_dist = min(max(self.v_ego * _MAX_TIME_GAP, _MIN_MAX_DIST), _RADAR_MAX_DIST)
     best: MergeCandidate | None = None
@@ -574,6 +608,18 @@ class SmartCruiseControlMerge:
                 offset * self.follow_side > 0. and abs(offset) < _RADAR_FOLLOW_MAX_OFFSET and dist < _RADAR_CONVERGE_MAX_DIST and
                 v_obj < self.v_ego + _RADAR_FOLLOW_MAX_FASTER and track.closing_speed > -_RADAR_FOLLOW_MAX_AWAY)
 
+      # Turn signal seen on this vehicle. Sides: signal -1 = left, offset > 0 = it is on our right.
+      seen = self.blinkers.get(slot)
+      signal = seen[0] if seen is not None and abs(seen[1] - dist) < _BLINKER_MATCH_DIST else 0
+      toward_us, away_from_us = signal * offset < 0., signal * offset > 0.
+      blinker = (toward_us and not converging and not early and not follow and dist < _BLINKER_MAX_DIST and
+                 abs(offset) < _RADAR_CONVERGE_MAX_OFFSET and v_obj < self.v_ego + _RADAR_CONVERGE_MAX_FASTER and
+                 track.closing_speed > -_RADAR_FOLLOW_MAX_AWAY)
+      if away_from_us:
+        slow = False  # it is signalling out of the way (an exit, or further over): no reason to hang back for it
+      if blinker:
+        self.ready_frames = _FRAMES(_READY_HOLD_TIME)
+
       if (dist < _READY_MAX_DIST and v_obj < self.v_ego + _READY_MAX_FASTER and track.moved_closer_early > _READY_MOVE and
           track.closing_speed > _RADAR_CONVERGE_SPEED[0]):
         self.ready_frames = _FRAMES(_READY_HOLD_TIME)
@@ -581,9 +627,9 @@ class SmartCruiseControlMerge:
       if closing > _EXIT_PEEL_MIN_SLOWER:
         slow_line[1. if offset > 0. else -1.].append((dist, abs(offset)))
 
-      if converging or slow or follow or early:
+      if converging or slow or follow or early or blinker:
         trigger = (TRIGGER_RADAR_CONVERGING if converging else TRIGGER_RADAR_FOLLOW if follow else
-                   TRIGGER_RADAR_EARLY if early else TRIGGER_RADAR_SLOW)
+                   TRIGGER_RADAR_EARLY if early else TRIGGER_BLINKER if blinker else TRIGGER_RADAR_SLOW)
         candidate = MergeCandidate(dist, offset, track.closing_speed, v_obj, trigger, slot)
         if trigger == TRIGGER_RADAR_SLOW:
           slow_candidates.append(candidate)  # decided below, once the whole line has been seen
@@ -761,7 +807,7 @@ class SmartCruiseControlMerge:
     if self.state == MergeState.slowing and self.candidate is not None:
       wanted = self.candidate.wanted_speed(self.v_ego)
       self.event_v_lead = self.candidate.v_lead
-      self.event_make_room = self.candidate.trigger not in (TRIGGER_RADAR_SLOW, TRIGGER_RADAR_EARLY)
+      self.event_make_room = self.candidate.trigger not in (TRIGGER_RADAR_SLOW, TRIGGER_RADAR_EARLY, TRIGGER_BLINKER)
       # Lowest speed we may ask for: the configured drop below where we started, and never under the absolute floor.
       floor = max(self.v_ref - self.max_drop, MIN_V_TARGET)
       ceiling = self.v_cruise_setpoint
