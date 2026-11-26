@@ -98,23 +98,36 @@ MEASURED_LAT_ACCEL_FACTOR = {
   "HYUNDAI_IONIQ_6": (2.5, 3.0),  # (placeholder that gets replaced, measured value)
 }
 
+# Steering friction: the share of full steering command needed just to get the rack moving.
+# Ioniq 6: sunnypilot's 0.005 is a placeholder (in effect "no friction"). On this car the rack visibly sticks: in the
+# recorded wobble (2026-11-25, 17:10) the wheel sits still while the command ramps, then jumps, about once every 0.8 s.
+# Measured: 0.063 by the device's own estimator, 0.04 to 0.07 from the drive log (gap between the left-moving and
+# right-moving branches). The sister car Ioniq 5 ships with 0.096. 0.05 is the cautious end of that range.
+MEASURED_FRICTION = {
+  "HYUNDAI_IONIQ_6": (0.005, 0.05),  # (placeholder that gets replaced, measured value)
+}
+
 
 def _apply_measured_torque_tune(CP: structs.CarParams) -> bool:
-  """Replace the placeholder steering strength with the measured one.
-  Only for the listed cars, only with torque steering, and only while the placeholder is still in place.
+  """Replace the placeholder steering strength and friction with the measured ones.
+  Only for the listed cars, only with torque steering, and each value only while its placeholder is still in place.
   Custom Tuning and Self-Tune in the settings are applied later by the controller and still win."""
+  changed = False
   try:
-    entry = MEASURED_LAT_ACCEL_FACTOR.get(str(CP.carFingerprint))
-    if entry is None or CP.lateralTuning.which() != 'torque':
+    if CP.lateralTuning.which() != 'torque':
       return False
-    placeholder, measured = entry
-    if not abs(float(CP.lateralTuning.torque.latAccelFactor) - placeholder) <= 1e-3:
-      return False
-    CP.lateralTuning.torque.latAccelFactor = measured
-    return True
+    car = str(CP.carFingerprint)
+    entry = MEASURED_LAT_ACCEL_FACTOR.get(car)
+    if entry is not None and abs(float(CP.lateralTuning.torque.latAccelFactor) - entry[0]) <= 1e-3:
+      CP.lateralTuning.torque.latAccelFactor = entry[1]
+      changed = True
+    entry = MEASURED_FRICTION.get(car)
+    if entry is not None and abs(float(CP.lateralTuning.torque.friction) - entry[0]) <= 1e-4:
+      CP.lateralTuning.torque.friction = entry[1]
+      changed = True
   except Exception:
     cloudlog.exception("measured torque tune not applied")
-    return False
+  return changed
 
 
 def setup_interfaces(CI: CarInterfaceBase, params: Params | None = None) -> None:
