@@ -114,7 +114,7 @@ def test_loop_reports_a_flashing_vehicle(monkeypatch):
   with pytest.raises(Done):
     blinkerd.run()
   hits = flashing(log)
-  assert log.events[0] == {"what": "started"} and 2 <= len(hits) <= 6
+  assert log.events[0] == {"what": "started", "error": True} and all(e["error"] is True for e in log.events) and 2 <= len(hits) <= 6
   assert all(h["side"] == "right" and h["slot"] == 7 and 13 < h["dist"] < 21 for h in hits) and not log.errors
 
 

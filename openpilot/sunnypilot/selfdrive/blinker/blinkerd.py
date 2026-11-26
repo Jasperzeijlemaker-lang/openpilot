@@ -31,7 +31,7 @@ def run() -> None:
   reporter = Reporter()
   sm = messaging.SubMaster(['carState', 'carStateSP', 'extrinsicsCalibration'])
   client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_NARROW_ROAD, True)
-  cloudlog.event("blinker_watch", what="started")
+  cloudlog.event("blinker_watch", error=True, what="started")   # error=True: see blinker_report.py
 
   last_frame_id = None
   frames = 0
@@ -73,7 +73,7 @@ def run() -> None:
       now = time.monotonic()
       if now - last_stats > STATS_EVERY:
         enabled = params.get_bool("BlinkerWatch")
-        cloudlog.event("blinker_watch", what="stats", frames=frames, ms_per_frame=round(1000. * spent / max(frames, 1), 2),
+        cloudlog.event("blinker_watch", error=True, what="stats", frames=frames, ms_per_frame=round(1000. * spent / max(frames, 1), 2),
                        vehicles=watcher.tracked, flashing_seen=reporter.count, errors=errors, enabled=enabled)
         frames, spent, last_stats = 0, 0., now
     except Exception:

@@ -21,7 +21,9 @@ class Reporter:
   """Turns per-frame detections into a few log lines: one when a vehicle starts flashing, then one a second."""
 
   def __init__(self, log=None, clock=time.monotonic):
-    self.log = log or (lambda **kw: cloudlog.event("blinker_watch", **kw))
+    # error=True is not a fault here: it is what routes a log line into the small logs (qlog),
+    # so the results can be read without uploading the big ones.
+    self.log = log or (lambda **kw: cloudlog.event("blinker_watch", error=True, **kw))
     self.clock = clock
     self.active: dict[int, tuple[int, float]] = {}   # slot -> (side, last report time)
     self.count = 0
