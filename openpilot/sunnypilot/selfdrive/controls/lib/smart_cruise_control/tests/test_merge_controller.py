@@ -862,7 +862,8 @@ class TestSmartCruiseControlMerge(OpenpilotTestCase):
     holding = [t for s, t in zip(states, targets, strict=True) if s == MergeState.holding]
     assert slowing and holding
     assert min(slowing) < v_obj - 1.
-    np.testing.assert_allclose(holding, v_obj - 0.5, atol=0.3)
+    np.testing.assert_allclose(holding, v_obj, atol=0.05)   # its speed exactly: the gap is not opened any further
+    assert len(holding) <= int(1.5 / DT_MDL) + 2            # and only for a moment, then the car's own cruise has it
 
   # ---------- early: a vehicle coming across fast from further out ----------
 

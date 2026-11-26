@@ -2,6 +2,8 @@
 pass it (keep speed), let it in ahead with the room that is already there, or make room."""
 import numpy as np
 
+from openpilot.common.realtime import DT_MDL
+
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.merge_controller import MergeState, TRIGGER_BLINKER, TRIGGER_LANE_ENDING, \
   TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_EARLY, TRIGGER_RADAR_FOLLOW
@@ -118,6 +120,60 @@ class TestPassOrWait(Base):
       dist = self.drive(0.1, dist=dist, right=right, v_obj=V_EGO - 2.7, v_cruise=V_EGO + 4.)
       right = max(3.2, right - 0.12)
     assert self.triggers & MOVING_IN
+
+  # ----- once it is in front -----
+
+  def merge_in(self, v_obj, dist=30., seconds=9., others=()):
+    """A car moves from the next lane into ours and stays. Returns [(time, state, asked speed, its offset)]."""
+    from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.tests.test_merge_controller import make_radar, make_model, make_car_state
+    cs, right, log = make_car_state(False, V_EGO), 3.8, []
+    for i in range(int(seconds / DT_MDL)):
+      if i > 30:
+        right = max(0.2, right - 0.7 * DT_MDL)
+      pts = [(5, dist, right, v_obj, V_EGO)] + [(s, d, r, v, V_EGO) for s, d, r, v in others]
+      self.scc.update({'modelV2': make_model([]), 'carState': cs, 'carStateSP': make_radar(pts)}, True, False, V_EGO, 0., V_EGO + 4.)
+      log.append((i * DT_MDL, self.scc.state, self.scc.output_v_target, right))
+      dist = max(6., dist + (v_obj - V_EGO) * DT_MDL)
+    return log
+
+  def test_in_front_at_our_speed_lets_go_at_once(self):
+    log = self.merge_in(V_EGO - 0.5)
+    active = [t for t, st, _, _ in log if st in (MergeState.slowing, MergeState.holding)]
+    entered = next(t for t, _, _, right in log if right <= 1.3)
+    assert active and min(active) < entered                 # it did slow for it while it was coming over
+    assert max(active) <= entered + 0.11                    # and let go within two frames of it being in our lane
+    assert all(out == V_CRUISE_UNSET for t, _, out, _ in log if t > entered + 0.11)
+
+  def test_in_front_but_slower_holds_its_speed_briefly_then_lets_go(self):
+    v_obj = V_EGO - 4.
+    log = self.merge_in(v_obj, dist=55.)
+    entered = next(t for t, _, _, right in log if right <= 1.3)
+    held = [(t, out) for t, st, out, _ in log if st == MergeState.holding]
+    assert held and all(abs(out - v_obj) < 0.05 for _, out in held)          # its speed, nothing lower
+    assert max(t for t, _ in held) <= entered + 1.5 + 0.11                   # 1.5 s at most, not the 3 s of before
+    assert log[-1][1] == MergeState.enabled and log[-1][2] == V_CRUISE_UNSET
+
+  def test_another_car_in_our_lane_does_not_end_the_slowdown(self):
+    # a lead that has been in front of us all along must not be mistaken for the car that is moving in
+    from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.tests.test_merge_controller import make_radar, make_model, make_car_state
+    lead = [(9, 60., 0.1, V_EGO)]
+    log = self.merge_in(V_EGO - 3., seconds=3.2, others=lead)
+    assert log[-1][1] == MergeState.slowing and log[-1][3] > 1.3
+    # the radar drops the merging car for a moment and only the lead is left: still not "it is in front now"
+    cs = make_car_state(False, V_EGO)
+    for _ in range(6):
+      self.scc.update({'modelV2': make_model([]), 'carState': cs, 'carStateSP': make_radar([(9, 60., 0.1, V_EGO, V_EGO)])}, True, False, V_EGO, 0., V_EGO + 4.)
+      assert self.scc.state == MergeState.slowing
+
+  def test_a_car_that_just_vanishes_still_gets_the_longer_hold(self):
+    self.drive(2.2, dist=30., right=3.8, v_obj=V_EGO - 3., lat_speed=0.7)
+    assert self.scc.state == MergeState.slowing
+    from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.tests.test_merge_controller import make_radar, make_model, make_car_state
+    cs, held = make_car_state(False, V_EGO), 0
+    for _ in range(int(6. / DT_MDL)):
+      self.scc.update({'modelV2': make_model([]), 'carState': cs, 'carStateSP': make_radar([])}, True, False, V_EGO, 0., V_EGO)
+      held += self.scc.state == MergeState.holding
+    assert 2.8 / DT_MDL <= held <= 3.2 / DT_MDL
 
   # ----- brake warning -----
 

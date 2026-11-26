@@ -213,6 +213,10 @@ _ENTER_TIME = 0.25  # s. A candidate must persist this long before we slow down
 _LOST_TIME = 0.5  # s. Candidate gone for this long: stop tracking it, start the hold timer
 _HOLD_TIME = 3.  # s. Keep the reduced speed this long after the vehicle is gone or has merged
 _MAX_EVENT_TIME = 40.  # s. Hard cap on one slowdown, guards against a stuck false detection
+# Once the vehicle we slowed for is in our lane, the car's own cruise follows it (and that cruise can brake).
+# Asked for by the owner: let go right away so the gap closes, instead of holding the lower speed for 3 s.
+_MERGED_SLOWER_OK = 1.  # m/s. In front of us and no more than this much slower than us: let go at once
+_MERGED_HOLD_TIME = 1.5  # s. In front but slower: hold ITS speed (nothing lower) at most this long, then let go
 _COOLDOWN_TIME = 3.  # s. Quiet time after an event before a new one may start
 _REARM_TIME = 1.  # s. After an event, no candidate may be seen for this long before a new event
 _TIMEOUT_LOCKOUT_TIME = 30.  # s. Quiet time after an event that hit _MAX_EVENT_TIME
@@ -368,6 +372,9 @@ class SmartCruiseControlMerge:
     self.use_blinkers = False
     self.blinkers: dict[int, tuple[int, float]] = {}  # radar slot -> (signal side: -1 left, +1 right; distance)
     self.radar_seen_frames = 0
+    self.event_slot = -1  # radar slot of the vehicle the running slowdown is for
+    self.merged_in = False
+    self.merged_v = 0.
     self.passes = 0  # times we chose to keep our speed and pass (for the log and for replays)
     self.last_pass: tuple | None = None
     self.mem_params = None
@@ -635,6 +642,7 @@ class SmartCruiseControlMerge:
 
     if len(points) > 0:
       self.radar_seen_frames = _FRAMES(_RADAR_SEEN_TIME)
+    self.merged_in = False
     for point in points:
       slot, dist, y_left, v_rel = int(point.slot), float(point.dRel), float(point.yRel), float(point.vRel)
       v_obj = self.v_ego + v_rel
@@ -646,6 +654,9 @@ class SmartCruiseControlMerge:
       offset = -y_left - float(np.interp(dist, path_x, path_y))
       track = self.radar_tracks.setdefault(slot, RadarTrack())
       track.update(dist, offset, dt)
+
+      if slot == self.event_slot and self.state in ACTIVE_STATES and abs(offset) <= _RADAR_IN_PATH_OFFSET:
+        self.merged_in, self.merged_v = True, v_obj  # the vehicle we slowed for is in our lane now
 
       if not _RADAR_IN_PATH_OFFSET < abs(offset) < _RADAR_MAX_OFFSET:
         continue
@@ -826,6 +837,8 @@ class SmartCruiseControlMerge:
     self.event_frames = 0
     self.hold_frames = 0
     self.event_make_room = False
+    self.event_slot = -1
+    self.merged_in = False
     self.v_target = V_CRUISE_UNSET
     if was_active:
       # Only an event that had to be cut off needs the road to look clear again before the next one.
@@ -868,6 +881,15 @@ class SmartCruiseControlMerge:
         elif self.state == MergeState.slowing:
           if self.event_frames >= _FRAMES(_MAX_EVENT_TIME):
             self._end_event(timed_out=True)
+          elif self.merged_in and self.candidate is None:
+            if self.merged_v >= self.v_ego - _MERGED_SLOWER_OK:
+              self._end_event()  # it is in front and not slower than us: nothing left to do
+            else:
+              # In front but slower: stop making room, hold its speed for a moment while the car's cruise picks it up.
+              self.state = MergeState.holding
+              self.hold_frames = _FRAMES(_MERGED_HOLD_TIME)
+              if _finite(self.merged_v, self.v_target, self.v_cruise_setpoint):
+                self.v_target = min(max(self.v_target, self.merged_v), self.v_cruise_setpoint)
           elif self.lost_frames >= _FRAMES(_LOST_TIME):
             # Vehicle is gone, or it finished merging and is now a normal lead.
             self.state = MergeState.holding
@@ -884,6 +906,8 @@ class SmartCruiseControlMerge:
             self._end_event(timed_out=True)
           elif self.hold_frames <= 0:
             self._end_event()
+          elif self.merged_in and self.candidate is None and self.merged_v >= self.v_ego - _MERGED_SLOWER_OK:
+            self._end_event()  # it is in front and we are no longer catching it
           elif self.detected:
             self.state = MergeState.slowing
 
@@ -913,6 +937,7 @@ class SmartCruiseControlMerge:
     if self.state == MergeState.slowing and self.candidate is not None:
       wanted = self.candidate.wanted_speed(self.v_ego)
       self.event_v_lead = self.candidate.v_lead
+      self.event_slot = self.candidate.slot
       self.event_make_room = self.candidate.trigger not in (TRIGGER_RADAR_SLOW, TRIGGER_RADAR_EARLY, TRIGGER_BLINKER)
       # Lowest speed we may ask for: the configured drop below where we started, and never under the absolute floor.
       floor = max(self.v_ref - self.max_drop, MIN_V_TARGET)
