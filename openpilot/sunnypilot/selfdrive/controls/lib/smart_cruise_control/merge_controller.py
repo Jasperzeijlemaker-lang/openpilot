@@ -98,6 +98,24 @@ TRIGGER_NONE, TRIGGER_MEASURED, TRIGGER_PREDICTED, TRIGGER_ENCROACHING, TRIGGER_
 TRIGGER_RADAR_CONVERGING, TRIGGER_RADAR_SLOW, TRIGGER_RADAR_FOLLOW, TRIGGER_RADAR_EARLY = 5, 6, 7, 8
 TRIGGER_BLINKER = 9
 
+# Pass or wait. A vehicle that wants into our lane is only worth slowing for if we cannot simply be past it first.
+_PASS_CLEAR_GAP = 10.  # m. Radar distance is our nose to its tail. Add both car lengths to be clear in front
+_PASS_MARGIN = 1.  # s. We must be clear at least this long before it would arrive
+_PASS_MAX_TIME = 4.  # s. Never plan on a pass that takes longer than this
+_PASS_MIN_CLOSING = 1.5  # m/s. We must really be faster
+_PASS_MOVING_IN_MAX_TIME = 2.  # s. A vehicle already moving over is only passed if we are almost past it
+_BLINKER_MOVE_TIME = 3.  # s. A driver who signals usually starts across about this long after
+# Waiting must also be possible. This cruise can only lift off, not brake: if getting in behind the vehicle would take
+# more slowing than that, hanging back is not an option. Then we keep our speed and go by. This is only used while it
+# is still more than a lane away (an on-ramp car). Once it is in the next lane we slow as much as the cruise can.
+_WAIT_GAP = 8.  # m we would want to be behind it
+_WAIT_MAX_DECEL = 1.5  # m/s2. More than the cruise can do
+_WAIT_WIDE_OFFSET = 5.  # m. Only for a vehicle still more than a lane away. One in the next lane always gets the slowdown
+# Fits ahead: it comes in far enough in front that matching its speed is all that is needed. No extra room is made.
+_FIT_GAP_NOW = 1.5  # s of our travel between us and it now
+_FIT_GAP_ON_ARRIVAL = 1.0  # s of our travel still left when it reaches our lane (we may be catching it meanwhile)
+_FIT_MAX_ARRIVAL_TIME = 4.  # s. Do not look further ahead than this when working out the gap on arrival
+
 # Turn signals seen by Blinker Watch (camera). A signal is a hint, not a move: it gives a head start, nothing more.
 _BLINKER_MAX_AGE = 1.2  # s. Blinker Watch repeats its note 5 times a second while a signal is flashing
 _BLINKER_READ_EVERY = 4  # model frames between looks at the note
@@ -199,8 +217,10 @@ def _finite(*values: float) -> bool:
 
 
 class MergeCandidate:
-  def __init__(self, dist: float, offset: float, closing_speed: float, v_lead: float, trigger: int = TRIGGER_NONE, slot: int = -1):
+  def __init__(self, dist: float, offset: float, closing_speed: float, v_lead: float, trigger: int = TRIGGER_NONE, slot: int = -1,
+               fits_ahead: bool = False):
     self.slot = slot  # radar slot of the vehicle, -1 for camera candidates
+    self.fits_ahead = fits_ahead  # it arrives with room to spare in front of us
     self.dist = dist
     self.offset = offset
     self.closing_speed = closing_speed
@@ -214,9 +234,14 @@ class MergeCandidate:
     if self.trigger == TRIGGER_BLINKER:
       # It has only signalled. Take most of the speed difference out; a real move over is handled by the other triggers.
       return self.v_lead + _BLINKER_DELTA
+    if self.trigger == TRIGGER_LANE_ENDING and self.slot >= 0:
+      # Radar vehicle whose lane is ending: come down to its speed so it can come in ahead of us.
+      return self.v_lead
     if self.trigger == TRIGGER_RADAR_EARLY:
       # Proactive: take most of the speed difference out before it arrives.
       return self.v_lead + _RADAR_EARLY_DELTA
+    if self.fits_ahead:
+      return self.v_lead  # there is room already: just do not run up on it
     # Make room: a little under its speed, lower still while it is close so the gap grows.
     time_gap = self.dist / max(v_ego, 0.1)
     return self.v_lead - _SPEED_MARGIN - float(np.interp(time_gap, _GAP_EXTRA_BP, _GAP_EXTRA_V))
@@ -323,6 +348,8 @@ class SmartCruiseControlMerge:
     self.both_sides = False
     self.use_blinkers = False
     self.blinkers: dict[int, tuple[int, float]] = {}  # radar slot -> (signal side: -1 left, +1 right; distance)
+    self.passes = 0  # times we chose to keep our speed and pass (for the log and for replays)
+    self.last_pass: tuple | None = None
     self.mem_params = None
     self.clock = time.monotonic
     self.max_drop = _DEFAULT_MAX_DROP_MPH * CV.MPH_TO_MS
@@ -388,6 +415,20 @@ class SmartCruiseControlMerge:
       self._read_params()
 
   # ----- detection -----
+
+  def _time_to_pass(self, dist: float, closing: float) -> float:
+    """Seconds until we are clear in front of a vehicle `dist` ahead that we are catching at `closing` m/s."""
+    if closing < _PASS_MIN_CLOSING:
+      return float('inf')
+    return (dist + _PASS_CLEAR_GAP) / closing
+
+  def _lane_end_time(self, dist: float, v_obj: float, side: float) -> float:
+    """Seconds until a vehicle in the next lane runs out of lane. inf when the camera sees no lane end on that side.
+    The camera reports a lane end when the lane is gone about _LANE_END_FAR_T seconds of our travel ahead."""
+    if not self.lane_ending[side]:
+      return float('inf')
+    far_x = min(max(self.v_ego * _LANE_END_FAR_T, _LANE_END_FAR_X_LIMITS[0]), _LANE_END_FAR_X_LIMITS[1])
+    return max(far_x - dist, 0.) / max(v_obj, 1.)
 
   def _read_blinkers(self) -> None:
     """Which vehicles Blinker Watch currently sees signalling. Any problem here means 'none', never a fault."""
@@ -617,20 +658,53 @@ class SmartCruiseControlMerge:
                  track.closing_speed > -_RADAR_FOLLOW_MAX_AWAY)
       if away_from_us:
         slow = False  # it is signalling out of the way (an exit, or further over): no reason to hang back for it
-      if blinker:
+
+      # Its lane is ending (camera) and it is slower than us: it has to come over.
+      side = 1. if offset > 0. else -1.
+      lane_end_time = self._lane_end_time(dist, v_obj, side)
+      lane_ending = (lane_end_time < float('inf') and not converging and not early and not follow and
+                     abs(offset) < _RADAR_CONVERGE_MAX_OFFSET and dist < _RADAR_CONVERGE_MAX_DIST and
+                     v_obj < self.v_ego - _LANE_END_SLOWER)
+
+      # Pass or wait: how long until we are clear in front of it, against how long until it arrives in our lane.
+      time_to_pass = self._time_to_pass(dist, closing)
+      time_to_lane = ((abs(offset) - _RADAR_IN_PATH_OFFSET) / track.closing_speed if track.closing_speed > 0.05 else float('inf'))
+      if converging:
+        time_it_needs, pass_limit = time_to_lane, _PASS_MOVING_IN_MAX_TIME
+      elif early:
+        time_it_needs, pass_limit = time_to_lane, _PASS_MAX_TIME
+      elif blinker or lane_ending:
+        time_it_needs, pass_limit = min(_BLINKER_MOVE_TIME if blinker else float('inf'), lane_end_time), _PASS_MAX_TIME
+      else:
+        time_it_needs, pass_limit = 0., 0.
+      can_pass = time_to_pass < pass_limit and time_to_pass + _PASS_MARGIN < time_it_needs
+      decel_to_wait = closing ** 2 / (2. * max(dist - _WAIT_GAP, 1.)) if closing > 0. else 0.
+      cannot_wait = decel_to_wait > _WAIT_MAX_DECEL and abs(offset) > _WAIT_WIDE_OFFSET
+      can_pass = can_pass or cannot_wait
+      if can_pass and not follow and (converging or early or blinker or lane_ending):
+        # We are past before it gets here: keep our speed, it comes in behind us.
+        self.passes += 1
+        self.last_pass = (slot, dist, closing, time_to_pass, time_it_needs,
+                          5 if converging else 8 if early else 9 if blinker else 4)
+        converging = early = blinker = lane_ending = False
+      elif blinker or lane_ending:
         self.ready_frames = _FRAMES(_READY_HOLD_TIME)
 
       if (dist < _READY_MAX_DIST and v_obj < self.v_ego + _READY_MAX_FASTER and track.moved_closer_early > _READY_MOVE and
-          track.closing_speed > _RADAR_CONVERGE_SPEED[0]):
+          track.closing_speed > _RADAR_CONVERGE_SPEED[0] and not can_pass):
         self.ready_frames = _FRAMES(_READY_HOLD_TIME)
 
       if closing > _EXIT_PEEL_MIN_SLOWER:
         slow_line[1. if offset > 0. else -1.].append((dist, abs(offset)))
 
-      if converging or slow or follow or early or blinker:
+      if converging or slow or follow or early or blinker or lane_ending:
         trigger = (TRIGGER_RADAR_CONVERGING if converging else TRIGGER_RADAR_FOLLOW if follow else
-                   TRIGGER_RADAR_EARLY if early else TRIGGER_BLINKER if blinker else TRIGGER_RADAR_SLOW)
-        candidate = MergeCandidate(dist, offset, track.closing_speed, v_obj, trigger, slot)
+                   TRIGGER_RADAR_EARLY if early else TRIGGER_LANE_ENDING if lane_ending else
+                   TRIGGER_BLINKER if blinker else TRIGGER_RADAR_SLOW)
+        arrival = min(time_to_lane, _FIT_MAX_ARRIVAL_TIME)
+        fits_ahead = (dist / max(self.v_ego, 0.1) > _FIT_GAP_NOW and
+                      (dist - max(closing, 0.) * arrival) / max(self.v_ego, 0.1) > _FIT_GAP_ON_ARRIVAL)
+        candidate = MergeCandidate(dist, offset, track.closing_speed, v_obj, trigger, slot, fits_ahead)
         if trigger == TRIGGER_RADAR_SLOW:
           slow_candidates.append(candidate)  # decided below, once the whole line has been seen
           continue
