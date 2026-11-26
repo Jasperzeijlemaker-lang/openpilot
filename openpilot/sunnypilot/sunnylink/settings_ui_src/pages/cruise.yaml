@@ -307,6 +307,10 @@ sections:
       - type: param
         key: SmartCruiseControlMerge
         equals: true
+    - key: FastSpeedDown
+      widget: toggle
+      title: Faster Speed-Down Button (test)
+      description: 'Ioniq 6 only. The cruise set speed is lowered with button presses. This sends the "speed down" presses twice as often, so slowdowns start sooner and pull more regen. A road test: turn it off if the set speed jumps around or the cruise acts up. Takes effect on the next drive.'
     - key: SmartCruiseControlMergeMaxDrop
       widget: option
       title: Max Speed Reduction (mph)

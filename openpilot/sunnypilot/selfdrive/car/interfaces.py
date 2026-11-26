@@ -10,6 +10,7 @@ from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.selfdrive.car import fast_speed_down
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import set_speed_limit_assist_availability
 
@@ -132,6 +133,7 @@ def setup_interfaces(CI: CarInterfaceBase, params: Params | None = None) -> None
   _initialize_intelligent_cruise_button_management(CI.CP, CI.CP_SP, params)
   _initialize_torque_lateral_control(CI, CI.CP, enforce_torque, nnlc_enabled)
   _apply_measured_torque_tune(CI.CP)
+  fast_speed_down.install(CI.CP, params)
   _cleanup_unsupported_params(CI.CP, CI.CP_SP)
 
   try:
